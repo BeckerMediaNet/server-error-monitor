@@ -111,9 +111,46 @@ if [[ "${SKIP_ENV:-false}" != true ]]; then
   ask SITE_LABEL "Server label for Slack messages (e.g. 'Acme Co - web01') [$(hostname)]: " "$(hostname)"
   ask_required SLACK_WEBHOOK_URL "Slack Incoming Webhook URL: "
 
-  # --- access logs ---
+  # --- Docker containers ---
+  DOCKER_CONTAINERS=""
+  if command -v docker >/dev/null 2>&1 && [[ -n "$(docker ps -q 2>/dev/null)" ]]; then
+    echo
+    echo "Docker is running on this server. Sites in containers (nginx-proxy, the"
+    echo "official nginx/httpd images, ...) usually log to stdout, so their access"
+    echo "logs live in Docker rather than /var/log and are watched by container name."
+    echo
+    echo "Running containers:"
+    docker ps --format '  {{.Names}}   ({{.Image}})'
+    CONTAINER_LIST="$(docker ps --format '{{.Names}} {{.Image}}')"
+    SUGGESTED="$(awk 'tolower($2) ~ /nginx-proxy|traefik/ { print $1 }' <<< "$CONTAINER_LIST" | paste -sd' ' -)"
+    echo
+    if [[ -n "$SUGGESTED" ]]; then
+      echo "Suggested: $SUGGESTED — the reverse proxy in front of every site. It logs"
+      echo "every request, including the 502/503s it returns when a site's container"
+      echo "is down. Don't also add the web server containers behind it, or the same"
+      echo "request gets counted twice."
+    else
+      SUGGESTED="$(awk 'tolower($0) ~ /nginx|httpd|apache|openresty/ && tolower($0) !~ /acme|letsencrypt/ { print $1 }' <<< "$CONTAINER_LIST" | paste -sd' ' -)"
+      [[ -n "$SUGGESTED" ]] && echo "Suggested (web server containers): $SUGGESTED"
+    fi
+    while :; do
+      ask DOCKER_CONTAINERS "Containers to watch, space-separated ('none' to skip) [${SUGGESTED:-none}]: " "${SUGGESTED:-none}"
+      if [[ "$DOCKER_CONTAINERS" == none ]]; then
+        DOCKER_CONTAINERS=""
+        break
+      fi
+      BAD=""
+      for name in $DOCKER_CONTAINERS; do
+        docker inspect "$name" >/dev/null 2>&1 || BAD+=" $name"
+      done
+      [[ -z "$BAD" ]] && break
+      echo "No such container:$BAD" >&2
+    done
+  fi
+
+  # --- host access logs ---
   echo
-  echo "Looking for web server access logs..."
+  echo "Looking for web server access logs on the host..."
   DETECTED_PATTERNS=()
   for pattern in "/var/log/nginx/*access*log" "/var/log/nginx/*/*access*log" \
                  "/var/log/apache2/*access*log" "/var/log/apache2/*/*access*log" \
@@ -127,15 +164,25 @@ if [[ "${SKIP_ENV:-false}" != true ]]; then
     DEFAULT_ACCESS_LOGS="${DETECTED_PATTERNS[*]}"
     echo "Found these access logs:"
     matching_logs "$DEFAULT_ACCESS_LOGS" | sed 's/^/  /'
+  elif [[ -n "$DOCKER_CONTAINERS" ]]; then
+    DEFAULT_ACCESS_LOGS="none"
+    echo "None in the usual nginx/Apache locations — fine if the containers above cover every site."
   else
     DEFAULT_ACCESS_LOGS="/var/log/nginx/*access*log"
     echo "No access logs found in the usual nginx/Apache locations — you'll need to enter the path."
   fi
   echo
-  echo "Enter the access log paths to watch, space-separated. Wildcards are fine and"
-  echo "are re-checked on every run, so new per-site logs get picked up automatically."
+  echo "Enter host access log paths to watch, space-separated ('none' to skip)."
+  echo "Wildcards are fine and are re-checked on every run, so new per-site logs"
+  echo "get picked up automatically."
   while :; do
     ask ACCESS_LOGS "Access logs [${DEFAULT_ACCESS_LOGS}]: " "$DEFAULT_ACCESS_LOGS"
+    if [[ "$ACCESS_LOGS" == none ]]; then
+      ACCESS_LOGS=""
+      [[ -n "$DOCKER_CONTAINERS" ]] && break
+      echo "No containers were chosen either, so nothing would be monitored — enter at least one log path." >&2
+      continue
+    fi
     MATCHED="$(matching_logs "$ACCESS_LOGS")"
     if [[ -n "$MATCHED" ]]; then
       echo "That matches $(wc -l <<< "$MATCHED" | tr -d ' ') file(s)."
@@ -193,6 +240,7 @@ if [[ "${SKIP_ENV:-false}" != true ]]; then
 SLACK_WEBHOOK_URL=${SLACK_WEBHOOK_URL}
 SITE_LABEL="${SITE_LABEL}"
 ACCESS_LOGS="${ACCESS_LOGS}"
+DOCKER_CONTAINERS="${DOCKER_CONTAINERS}"
 ERROR_CODES=${ERROR_CODES}
 ERROR_THRESHOLD=${ERROR_THRESHOLD}
 ${THRESHOLD_LINES}CHECK_KERNEL=${CHECK_KERNEL}
@@ -220,7 +268,7 @@ fi
 
 echo
 echo "Dry run against the current logs, to confirm they parse (nothing is sent"
-echo "to Slack — the counts below cover the whole current log, not 5 minutes):"
+echo "to Slack — the counts below cover up to the last 5 MB of each log, not 5 minutes):"
 echo
 "$CHECK_SCRIPT" --env "$ENV_FILE" --dry-run
 

@@ -2,9 +2,10 @@
 #
 # check-server-errors.sh
 #
-# Watches the web server access logs for spikes of HTTP error codes and the
-# kernel log for php-fpm segfaults / general protection faults, and posts a
-# Slack alert via an Incoming Webhook when either crosses its threshold.
+# Watches the web server access logs (host log files and/or the stdout logs
+# of Docker containers) for spikes of HTTP error codes and the kernel log for
+# php-fpm segfaults / general protection faults, and posts a Slack alert via
+# an Incoming Webhook when either crosses its threshold.
 #
 # Only what's new since the previous run is counted (byte offsets for log
 # files, a timestamp for the systemd journal), so it's designed to run from
@@ -60,7 +61,8 @@ set +a
 : "${SLACK_WEBHOOK_URL:?SLACK_WEBHOOK_URL not set in $ENV_FILE}"
 
 SITE_LABEL="${SITE_LABEL:-$(hostname)}"
-ACCESS_LOGS="${ACCESS_LOGS:-/var/log/nginx/*access*log /var/log/apache2/*access*log /var/log/httpd/*access*log}"
+ACCESS_LOGS="${ACCESS_LOGS-/var/log/nginx/*access*log /var/log/apache2/*access*log /var/log/httpd/*access*log}"
+DOCKER_CONTAINERS="${DOCKER_CONTAINERS:-}"
 ERROR_CODES="${ERROR_CODES:-500,502,503,504}"
 ERROR_THRESHOLD="${ERROR_THRESHOLD:-50}"
 CHECK_KERNEL="${CHECK_KERNEL:-true}"
@@ -132,8 +134,8 @@ fi
 
 TMP_DIR="$(mktemp -d)"
 trap 'rm -rf "$TMP_DIR"' EXIT
-MATCHES="$TMP_DIR/matches.tsv"   # code<TAB>client<TAB>path<TAB>logfile, one row per monitored error
-STATS="$TMP_DIR/stats"           # logfile<TAB>lines<TAB>unparsed, one row per access log
+MATCHES="$TMP_DIR/matches.tsv"   # code<TAB>client<TAB>path<TAB>source<TAB>site, one row per monitored error
+STATS="$TMP_DIR/stats"           # source<TAB>lines<TAB>unparsed, one row per log source
 : > "$MATCHES"
 : > "$STATS"
 
@@ -168,7 +170,7 @@ head_sum() {
 # if the file shrank or its first bytes changed (copytruncate, even when it
 # has already grown past the old position), it's read from the start. With no saved
 # position it only records one (first run) — except in a dry run, where it
-# prints the whole current file so you can see what the parser makes of it.
+# prints the last 5 MB so you can see what the parser makes of it.
 read_new() {
   local file="$1" offset_file inode size old_inode="" old_offset="" old_head="" old_head_len=0 rotated head_len
   offset_file="$STATE_DIR/offset_$(state_key "$file")"
@@ -182,7 +184,7 @@ read_new() {
 
   if [[ -z "$old_offset" ]]; then
     if [[ "$DRY_RUN" == true ]]; then
-      cat "$file"
+      tail -c 5000000 "$file"
     else
       log "Baseline for $file at byte $size (first time seeing it — existing lines not counted)"
     fi
@@ -210,7 +212,11 @@ read_new() {
 # --- HTTP error check -------------------------------------------------------
 # Works with the default nginx "combined" and Apache combined/common formats
 # (and anything else with `"<request>" <status> ` in it): the status code is
-# the first 3-digit number that follows a closing quote. Written for plain
+# the first 3-digit number that follows a closing quote. The client is the
+# first IP address before the [timestamp], and if a hostname comes right
+# before it — nginx-proxy's "vhost" format, Apache's vhost_combined — that's
+# recorded as the site. Anything in front of those (like the "nginx.1 |"
+# prefix nginx-proxy's process manager adds) is ignored. Written for plain
 # POSIX awk (mawk on Debian/Ubuntu) — no gawk extensions.
 AWK_PARSE='
 BEGIN {
@@ -233,7 +239,17 @@ NF == 0 { next }
   path = (parts[2] != "") ? parts[2] : req
   sub(/\?.*/, "", path)
   if (length(path) > 100) path = substr(path, 1, 100) "..."
-  print code "\t" $1 "\t" path "\t" src
+  client = $1; site = ""
+  for (i = 1; i <= NF && substr($i, 1, 1) != "["; i++) {
+    if ($i ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/ || $i ~ /^[0-9a-fA-F]*:[0-9a-fA-F]*:[0-9a-fA-F:.]*$/) {
+      client = $i
+      if (i > 1 && $(i - 1) ~ /[A-Za-z]/ && $(i - 1) ~ /\./ && $(i - 1) !~ /[|]/) {
+        site = $(i - 1); sub(/:[0-9]+$/, "", site)
+      }
+      break
+    }
+  }
+  print code "\t" client "\t" path "\t" src "\t" site
 }
 END { print src "\t" (total + 0) "\t" (unparsed + 0) >> stats }
 '
@@ -259,6 +275,60 @@ for f in ${LOG_FILES[@]+"${LOG_FILES[@]}"}; do
   read_new "$f" | awk -v codes="$ERROR_CODES" -v src="$f" -v stats="$STATS" "$AWK_PARSE" >> "$MATCHES"
 done
 
+# read_container <name>
+# Prints the stdout lines a container has logged since the last run (access
+# logs go to stdout in nginx-proxy and the official nginx/httpd images; error
+# logs go to stderr and are skipped). With Docker's default json-file driver
+# the container's log file is read directly via read_new — cheap even when it
+# has grown to gigabytes, unlike `docker logs --since`, which rescans it from
+# the start — and the JSON wrapper is stripped off. A changed log path means
+# the container was recreated since the last run, so its new log is read from
+# the start. Other log drivers fall back to `docker logs --since`.
+read_container() {
+  local name="$1" driver path path_file prev ts_file since
+  read -r driver path < <(docker inspect -f '{{.HostConfig.LogConfig.Type}} {{.LogPath}}' "$name" 2>/dev/null) || return 0
+
+  if [[ "$driver" == json-file && -r "$path" ]]; then
+    path_file="$STATE_DIR/docker_$(state_key "$name").path"
+    prev="$(cat "$path_file" 2>/dev/null || true)"
+    if [[ -n "$prev" && "$prev" != "$path" ]]; then
+      log "Container $name was recreated — reading its new log from the start"
+      [[ "$DRY_RUN" == true ]] || rm -f "$STATE_DIR/offset_$(state_key "$prev")"
+      write_state "$STATE_DIR/offset_$(state_key "$path")" "$(stat -c %i "$path") 0"
+    fi
+    write_state "$path_file" "$path"
+    read_new "$path" | sed -e '/"stream":"stdout"/!d' -e 's/^{"log":"//' \
+      -e 's/\(\\n\)\{0,1\}","stream":.*$//' -e 's/\\"/"/g'
+  else
+    ts_file="$STATE_DIR/docker_$(state_key "$name").ts"
+    since="$(cat "$ts_file" 2>/dev/null || true)"
+    if [[ -n "$since" ]]; then
+      docker logs --since "$since" --until "$NOW" "$name" 2>/dev/null
+    elif [[ "$DRY_RUN" == true ]]; then
+      docker logs --tail 20000 "$name" 2>/dev/null
+    else
+      log "Baseline for container $name (first time seeing it — earlier lines not counted)"
+    fi
+    write_state "$ts_file" "$NOW"
+  fi
+}
+
+CONTAINERS=()
+MISSING_CONTAINERS=()
+if [[ -n "$DOCKER_CONTAINERS" ]] && ! command -v docker >/dev/null 2>&1; then
+  say "DOCKER_CONTAINERS is set but docker isn't on PATH"
+fi
+for name in $DOCKER_CONTAINERS; do
+  if command -v docker >/dev/null 2>&1 && docker inspect "$name" >/dev/null 2>&1; then
+    CONTAINERS+=("$name")
+    read_container "$name" | awk -v codes="$ERROR_CODES" -v src="docker:$name" -v stats="$STATS" "$AWK_PARSE" >> "$MATCHES"
+  else
+    say "Container $name not found"
+    MISSING_CONTAINERS+=("$name")
+  fi
+done
+SOURCE_COUNT=$(( ${#LOG_FILES[@]} + ${#CONTAINERS[@]} ))
+
 declare -A CODE_COUNT=()
 while read -r n code; do
   [[ -n "$code" ]] && CODE_COUNT[$code]=$n
@@ -282,7 +352,7 @@ threshold_for() {
 
 # top_list <code> <column> — "`value` (count), ..." for the busiest values.
 top_list() {
-  awk -F'\t' -v c="$1" -v col="$2" '$1 == c { print $col }' "$MATCHES" \
+  awk -F'\t' -v c="$1" -v col="$2" '$1 == c && $col != "" { print $col }' "$MATCHES" \
     | sort | uniq -c | sort -rn | head -n "$TOP_N" \
     | awk '{ n = $1; $1 = ""; sub(/^ /, ""); printf "%s`%s` (%d)", (NR > 1 ? ", " : ""), $0, n }'
 }
@@ -374,7 +444,7 @@ for f in "$STATE_DIR"/alert_http_*; do
 done
 
 SUMMARY=""
-(( ${#LOG_FILES[@]} == 0 )) && CODES_TO_EVALUATE=()
+(( SOURCE_COUNT == 0 )) && CODES_TO_EVALUATE=()
 for code in $(printf '%s\n' ${CODES_TO_EVALUATE[@]+"${CODES_TO_EVALUATE[@]}"} | sort -u); do
   count="${CODE_COUNT[$code]:-0}"
   threshold="$(threshold_for "$code")"
@@ -383,8 +453,11 @@ for code in $(printf '%s\n' ${CODES_TO_EVALUATE[@]+"${CODES_TO_EVALUATE[@]}"} | 
   alert_text=""
   if (( count > threshold )); then
     triggered=true
-    alert_text="*HTTP ${code}*: ${count} in ${WINDOW_LABEL} (threshold ${threshold})"$'\n'"• Top paths: $(top_list "$code" 3)"$'\n'"• Top clients: $(top_list "$code" 2)"
-    if (( ${#LOG_FILES[@]} > 1 )); then
+    alert_text="*HTTP ${code}*: ${count} in ${WINDOW_LABEL} (threshold ${threshold})"
+    sites="$(top_list "$code" 5)"
+    [[ -n "$sites" ]] && alert_text+=$'\n'"• Top sites: ${sites}"
+    alert_text+=$'\n'"• Top paths: $(top_list "$code" 3)"$'\n'"• Top clients: $(top_list "$code" 2)"
+    if (( SOURCE_COUNT > 1 )); then
       alert_text+=$'\n'"• Logs: $(top_list "$code" 4)"
     fi
   fi
@@ -404,20 +477,32 @@ if [[ "$CHECK_KERNEL" == true && -n "$KERNEL_SOURCE_USED" ]]; then
 fi
 
 # A monitor watching nothing should say so rather than stay silently green.
-if (( ${#LOG_FILES[@]} == 0 )); then
-  say "No access logs matched ACCESS_LOGS=\"$ACCESS_LOGS\""
+if (( SOURCE_COUNT == 0 )); then
+  say "No access logs found (ACCESS_LOGS=\"$ACCESS_LOGS\" DOCKER_CONTAINERS=\"$DOCKER_CONTAINERS\")"
   evaluate "config_no_logs" true \
-    "*No access logs found* — nothing matched ACCESS_LOGS=\`${ACCESS_LOGS}\`, so HTTP errors are NOT being monitored. Fix it in ${ENV_FILE}." \
+    "*No access logs found* — nothing matched ACCESS_LOGS=\`${ACCESS_LOGS:-(none)}\` and no container in DOCKER_CONTAINERS=\`${DOCKER_CONTAINERS:-(none)}\` exists, so HTTP errors are NOT being monitored. Fix it in ${ENV_FILE}." \
     ""
 else
-  evaluate "config_no_logs" false "" "Access logs found again (${#LOG_FILES[@]} file(s)) — HTTP error monitoring resumed"
+  evaluate "config_no_logs" false "" "Access logs found again (${SOURCE_COUNT} source(s)) — HTTP error monitoring resumed"
 fi
 
-log "Checked ${#LOG_FILES[@]} log(s), ${TOTAL_LINES} lines (${TOTAL_UNPARSED} unparsed); codes:${SUMMARY:- none}; kernel(${KERNEL_SOURCE_USED:-off}): segfault=${SEGFAULTS} gpf=${GPFS}"
+# A configured container that has disappeared (removed, renamed by a compose
+# project change) is checked separately, since other sources may still be fine.
+for name in $DOCKER_CONTAINERS; do
+  missing=false
+  for m in ${MISSING_CONTAINERS[@]+"${MISSING_CONTAINERS[@]}"}; do
+    [[ "$m" == "$name" ]] && missing=true
+  done
+  evaluate "docker_missing_$(state_key "$name")" "$missing" \
+    "*Container \`${name}\` not found* — its access log is NOT being monitored. If it was renamed, update DOCKER_CONTAINERS in ${ENV_FILE}." \
+    "Container \`${name}\` is back — monitoring its access log again"
+done
+
+log "Checked ${SOURCE_COUNT} log source(s), ${TOTAL_LINES} lines (${TOTAL_UNPARSED} unparsed); codes:${SUMMARY:- none}; kernel(${KERNEL_SOURCE_USED:-off}): segfault=${SEGFAULTS} gpf=${GPFS}"
 
 # --- report -----------------------------------------------------------------
 if [[ "$DRY_RUN" == true ]]; then
-  echo "Access logs (${#LOG_FILES[@]}):"
+  echo "Log sources (${SOURCE_COUNT}):"
   while IFS=$'\t' read -r src lines unparsed; do
     echo "  $src — $lines lines read, $unparsed without a recognisable status code"
   done < "$STATS"
