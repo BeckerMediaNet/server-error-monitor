@@ -1,0 +1,7 @@
+# Per-server secrets and runtime state — never commit these
+.env
+state/
+logs/
+
+# macOS
+.DS_Store
