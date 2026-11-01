@@ -5,6 +5,11 @@ Server-level watchdog that posts to Slack when:
 - **HTTP errors spike.** Any single monitored status code (default
   `500,502,503,504`) shows up **more than 50 times** in the web server access
   logs since the previous run.
+- **A form POST is refused (403).** Any one: a visitor could not send the
+  form. Per site. Bots and scanners don't count (see [403 checks](#403-checks)).
+- **403s spike.** More than **50** 403s on paths visitors ask for, from at
+  least 3 clients, since the previous run: a firewall or block rule is
+  turning people away. Scanner paths (`/.env`, `/wp-login.php`, ...) never count.
 - **php-fpm is crashing.** The kernel log shows **3 or more** php-fpm
   segfaults / general protection faults (combined) since the previous run.
 
@@ -52,6 +57,22 @@ That command:
 
 Re-running the same command later pulls the latest code and re-runs setup
 (it asks before overwriting an existing `.env`).
+
+**On many servers at once**, with no questions: put the servers in a file
+(one `[user@]host` per line) and the Slack webhook URL in another, then from
+a machine that can SSH to them as root (or a user with passwordless sudo):
+
+```bash
+./fleet-install.sh servers.txt webhook.txt
+```
+
+Each server runs `install.sh --non-interactive`: access logs and containers
+are auto-detected, the label is the DigitalOcean droplet name (else the
+hostname), a server with no web access logs or containers is skipped, and a
+server that already has an `.env` keeps it and just gets the latest code. The
+webhook goes over ssh's stdin, never on a command line. For one server:
+`sudo SLACK_WEBHOOK_URL=... bash install-server-error-monitor.sh --non-interactive`
+(any other `.env` setting can be given the same way).
 
 ## How it works
 
@@ -106,6 +127,30 @@ reboot are not counted after it.
 
 A lock (`flock`) stops a slow run from overlapping the next cron tick.
 
+## 403 checks
+
+Every 403 in the watched logs is looked at, whatever `ERROR_CODES` says:
+
+- **Refused form POST**: a `POST` from a browser (`Mozilla/` agent, not one
+  that names itself a bot: `compatible;`, a `+http` link, `headless`) that
+  carried the page it came from (`Referer`), to `admin-ajax.php`, a form
+  plugin's REST route (Gravity Forms, Contact Form 7, WPForms, Formidable,
+  Ninja Forms, Forminator) or a page. One is enough to alert, per site, with
+  the usual cooldown and recovery. A bot or scanner POST carries no Referer:
+  on 10/29, across 13 servers, every real refused form POST had one and no bot
+  did. WordPress answering `admin-ajax.php` with its 2-byte `-1`/`0` (a stale
+  nonce on a cached page) is not a block and is left out.
+- **403 spike**: all other 403s on paths a visitor could ask for. Scanner paths
+  never count: dot files (`/.env`, `/.git/`), `.php` files other than
+  `index.php`, `wp-login.php`, `xmlrpc.php`, `/wp-admin/`, backups and
+  archives, and POSTs with no Referer. Alerts on more than
+  `SPIKE_403_THRESHOLD` (50) from at least `SPIKE_403_MIN_CLIENTS` (3)
+  different clients in a run, so one bot hammering a page doesn't.
+
+`FORM_403_CHECK=false` turns the form check off; `SPIKE_403_THRESHOLD=0`
+the spike. With Docker, watch the proxy (below): it is the one that logs the
+403s its sites answer.
+
 ## Docker
 
 Containers built on nginx-proxy or the official `nginx`/`httpd` images log
@@ -152,6 +197,8 @@ host kernel, so their segfaults land in the host's kernel log.
 
 ```
 install.sh                   one-command entry point (clone/update + hand off to setup.sh)
+fleet-install.sh             install/update on many servers over SSH, no questions
+test/run.sh                  the checks against crafted log lines, in a throwaway container (needs docker)
 setup.sh                     interactive configurator (writes .env, tests Slack, dry run, installs cron)
 bin/check-server-errors.sh   the actual check, run by root's cron every 5 minutes
 .env.example                 reference list of every config value, for manual editing
@@ -179,6 +226,10 @@ tail /opt/server-error-monitor/logs/server-error-monitor.log
 `--dry-run` reads from the saved positions. For a log with no saved
 position yet, it reads the last 5 MB of the file (the current boot for the
 journal), which is handy for checking the log format parses.
+
+Automated: `test/run.sh` runs the checks (403 form POSTs, 403 spikes, the
+existing HTTP error alert, cooldown/recovery, `setup.sh --non-interactive`)
+against crafted log lines in a throwaway Debian container with a fake Slack.
 
 To reset everything (e.g. after changing `ACCESS_LOGS`), delete
 `/opt/server-error-monitor/state/`. The next run re-baselines.
