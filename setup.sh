@@ -108,7 +108,7 @@ if [[ -f "$ENV_FILE" ]]; then
 fi
 
 if [[ "${SKIP_ENV:-false}" != true ]]; then
-  ask SITE_LABEL "Server label for Slack messages (e.g. 'Acme Co - web01') [$(hostname)]: " "$(hostname)"
+  ask SITE_LABEL "Site URL for Slack messages (e.g. 'acme.com') [$(hostname)]: " "$(hostname)"
   ask_required SLACK_WEBHOOK_URL "Slack Incoming Webhook URL: "
 
   # --- Docker containers ---
