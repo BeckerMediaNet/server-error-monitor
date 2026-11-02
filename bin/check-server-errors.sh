@@ -111,7 +111,7 @@ send_slack() {
 # --- test mode ---------------------------------------------------------
 if [[ "$TEST_SLACK" == true ]]; then
   echo "Sending test message to Slack..."
-  if send_slack ":white_check_mark: Test message from the server error monitor on *${SITE_LABEL}* ($(hostname)). Slack connection is working."; then
+  if send_slack ":white_check_mark: Test message from the server error monitor for *${SITE_LABEL}*. Slack connection is working."; then
     echo
     echo "Sent. Check the Slack channel tied to your webhook."
     exit 0
@@ -142,9 +142,11 @@ STATS="$TMP_DIR/stats"           # source<TAB>lines<TAB>unparsed, one row per lo
 NOW="$(date +%s)"
 LAST_RUN="$(cat "$LAST_RUN_FILE" 2>/dev/null || echo "")"
 if [[ -n "$LAST_RUN" ]] && (( NOW - LAST_RUN < 120 )); then
-  WINDOW_LABEL="the last $(( NOW - LAST_RUN ))s"
+  WINDOW_LABEL="the last $(( NOW - LAST_RUN )) seconds"
+elif [[ -n "$LAST_RUN" ]] && (( NOW - LAST_RUN < 7200 )); then
+  WINDOW_LABEL="the last $(( (NOW - LAST_RUN + 30) / 60 )) minutes"
 elif [[ -n "$LAST_RUN" ]]; then
-  WINDOW_LABEL="the last $(( (NOW - LAST_RUN + 30) / 60 ))m"
+  WINDOW_LABEL="the last $(( (NOW - LAST_RUN + 1800) / 3600 )) hours"
 else
   WINDOW_LABEL="this run"
 fi
@@ -213,12 +215,18 @@ read_new() {
 # Works with the default nginx "combined" and Apache combined/common formats
 # (and anything else with `"<request>" <status> ` in it): the status code is
 # the first 3-digit number that follows a closing quote. The client is the
-# first IP address before the [timestamp], and if a hostname comes right
-# before it — nginx-proxy's "vhost" format, Apache's vhost_combined — that's
-# recorded as the site. Anything in front of those (like the "nginx.1 |"
-# prefix nginx-proxy's process manager adds) is ignored. Written for plain
-# POSIX awk (mawk on Debian/Ubuntu) — no gawk extensions.
+# IP address three fields before the [timestamp] ("<ip> <ident> <user> [ts]"),
+# falling back to the first IP address before it. If a hostname or IP comes
+# right before the client — nginx-proxy's "vhost" format, Apache's
+# vhost_combined — that's recorded as the site (an IP there means the request
+# was sent to the server's bare IP, not to a site name). Anything in front of
+# those (like the "nginx.1 |" prefix nginx-proxy's process manager adds) and
+# terminal colour codes are ignored. Written for plain POSIX awk (mawk on
+# Debian/Ubuntu) — no gawk extensions.
 AWK_PARSE='
+function is_ip(s) {
+  return s ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/ || s ~ /^[0-9a-fA-F]*:[0-9a-fA-F]*:[0-9a-fA-F:.]*$/
+}
 BEGIN {
   n = split(codes, list, ",")
   for (i = 1; i <= n; i++) {
@@ -226,9 +234,13 @@ BEGIN {
     if (c ~ /^[1-5]xx$/) cls[substr(c, 1, 1)] = 1
     else if (c != "") exact[c] = 1
   }
+  esc = sprintf("%c", 27)
 }
 NF == 0 { next }
 {
+  # nginx-proxy colours its output; in Docker JSON logs the escape shows up
+  # as a literal \u001b, elsewhere as a real ESC character.
+  gsub(esc "\\[[0-9;]*m", ""); gsub(/\\u001b\[[0-9;]*m/, "")
   total++
   if (!match($0, /" [1-5][0-9][0-9] /)) { unparsed++; next }
   code = substr($0, RSTART + 2, 3)
@@ -239,14 +251,15 @@ NF == 0 { next }
   path = (parts[2] != "") ? parts[2] : req
   sub(/\?.*/, "", path)
   if (length(path) > 100) path = substr(path, 1, 100) "..."
-  client = $1; site = ""
-  for (i = 1; i <= NF && substr($i, 1, 1) != "["; i++) {
-    if ($i ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/ || $i ~ /^[0-9a-fA-F]*:[0-9a-fA-F]*:[0-9a-fA-F:.]*$/) {
-      client = $i
-      if (i > 1 && $(i - 1) ~ /[A-Za-z]/ && $(i - 1) ~ /\./ && $(i - 1) !~ /[|]/) {
-        site = $(i - 1); sub(/:[0-9]+$/, "", site)
-      }
-      break
+  client = $1; site = ""; ci = 0
+  for (j = 1; j <= NF && substr($j, 1, 1) != "["; j++) ;
+  if (j <= NF && j > 3 && is_ip($(j - 3))) ci = j - 3
+  else for (i = 1; i < j; i++) if (is_ip($i)) { ci = i; break }
+  if (ci > 0) {
+    client = $ci
+    if (ci > 1) {
+      s = $(ci - 1); sub(/:[0-9]+$/, "", s)
+      if (s !~ /[|]/ && s ~ /\./ && (s ~ /[A-Za-z]/ || is_ip(s))) site = s
     }
   }
   print code "\t" client "\t" path "\t" src "\t" site
@@ -350,11 +363,59 @@ threshold_for() {
   printf '%s' "${!var:-$ERROR_THRESHOLD}"
 }
 
-# top_list <code> <column> — "`value` (count), ..." for the busiest values.
+# top_list <code> <column> <noun> — "`value` (count), ... and N other <noun>s"
+# for the busiest values. A bare IPv4 address in the site column is flagged,
+# since it means the request didn't name a site at all.
 top_list() {
   awk -F'\t' -v c="$1" -v col="$2" '$1 == c && $col != "" { print $col }' "$MATCHES" \
-    | sort | uniq -c | sort -rn | head -n "$TOP_N" \
-    | awk '{ n = $1; $1 = ""; sub(/^ /, ""); printf "%s`%s` (%d)", (NR > 1 ? ", " : ""), $0, n }'
+    | sort | uniq -c | sort -rn \
+    | awk -v top="$TOP_N" -v noun="$3" -v site_col="$([[ $2 == 5 ]] && echo 1 || echo 0)" '
+        NR <= top {
+          n = $1; $1 = ""; sub(/^ /, "")
+          note = (site_col && $0 ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/) ? ", the server IP, not a site name" : ""
+          printf "%s`%s` (%d%s)", (NR > 1 ? ", " : ""), $0, n, note
+        }
+        END { if (NR > top) printf " and %d other %s%s", NR - top, noun, (NR - top == 1 ? "" : "s") }'
+}
+
+# top_share <code> <column> — percentage of a code's matches that come from
+# its single most common value.
+top_share() {
+  awk -F'\t' -v c="$1" -v col="$2" '
+    $1 == c { t++; if ($col != "" && ++n[$col] > m) m = n[$col] }
+    END { print (t ? int(m * 100 / t) : 0) }' "$MATCHES"
+}
+
+# code_name <code> — the standard name of an HTTP status code.
+code_name() {
+  case "$1" in
+    400) echo "Bad Request" ;;            401) echo "Unauthorized" ;;
+    403) echo "Forbidden" ;;              404) echo "Not Found" ;;
+    405) echo "Method Not Allowed" ;;     408) echo "Request Timeout" ;;
+    413) echo "Content Too Large" ;;      429) echo "Too Many Requests" ;;
+    499) echo "Client Closed Request" ;;  500) echo "Internal Server Error" ;;
+    501) echo "Not Implemented" ;;        502) echo "Bad Gateway" ;;
+    503) echo "Service Unavailable" ;;    504) echo "Gateway Timeout" ;;
+    5*) echo "Server Error" ;;            4*) echo "Client Error" ;;
+    *) echo "" ;;
+  esac
+}
+
+# code_meaning <code> — one plain-English sentence on what the code means.
+code_meaning() {
+  case "$1" in
+    500) echo "The site's code failed while building these pages (for example a PHP fatal error or a broken plugin)." ;;
+    502) echo "The web server couldn't get an answer from the app behind it, usually because PHP or the site's container is down or crashing." ;;
+    503) echo "The server turned these requests away: it was overloaded or in maintenance mode, or no site is set up for the address that was requested." ;;
+    504) echo "The app behind the web server took too long to answer, often because of slow pages, a slow database or all PHP workers being busy." ;;
+    404) echo "Requests for pages that don't exist. Spikes are usually bots probing for vulnerable files, or broken links." ;;
+    403) echo "Requests blocked by access rules, a firewall or a security plugin." ;;
+    429) echo "Visitors were rate-limited for sending too many requests." ;;
+    499) echo "Visitors gave up and disconnected before the server answered, which usually means pages are slow." ;;
+    5*) echo "The server failed to handle these requests." ;;
+    4*) echo "The server rejected these requests." ;;
+    *) echo "" ;;
+  esac
 }
 
 # --- kernel fault check -----------------------------------------------------
@@ -449,20 +510,32 @@ for code in $(printf '%s\n' ${CODES_TO_EVALUATE[@]+"${CODES_TO_EVALUATE[@]}"} | 
   count="${CODE_COUNT[$code]:-0}"
   threshold="$(threshold_for "$code")"
   SUMMARY+=" ${code}=${count}"
+  label="${code} $(code_name "$code")"
+  label="${label% }"
   triggered=false
   alert_text=""
   if (( count > threshold )); then
     triggered=true
-    alert_text="*HTTP ${code}*: ${count} in ${WINDOW_LABEL} (threshold ${threshold})"
-    sites="$(top_list "$code" 5)"
-    [[ -n "$sites" ]] && alert_text+=$'\n'"• Top sites: ${sites}"
-    alert_text+=$'\n'"• Top paths: $(top_list "$code" 3)"$'\n'"• Top clients: $(top_list "$code" 2)"
+    alert_text="*${label}*: ${count} responses in ${WINDOW_LABEL} (alerts above ${threshold})"
+    meaning="$(code_meaning "$code")"
+    [[ -n "$meaning" ]] && alert_text+=$'\n'"_${meaning}_"
+    sites="$(top_list "$code" 5 site)"
+    if [[ -n "$sites" ]]; then
+      alert_text+=$'\n'"• Sites affected: ${sites}"
+      [[ "$sites" == *"the server IP, not a site name"* ]] && \
+        alert_text+=". Requests to the bare server IP are almost always bots scanning the internet, not real visitors."
+    fi
+    alert_text+=$'\n'"• Most-requested URLs: $(top_list "$code" 3 URL)"
+    alert_text+=$'\n'"• Visitor IP addresses: $(top_list "$code" 2 IP)"
+    share="$(top_share "$code" 2)"
+    (( count >= 20 && share >= 80 )) && \
+      alert_text+=". ${share}% came from one IP, so this is most likely a single bot or scanner."
     if (( SOURCE_COUNT > 1 )); then
-      alert_text+=$'\n'"• Logs: $(top_list "$code" 4)"
+      alert_text+=$'\n'"• Found in logs: $(top_list "$code" 4 log)"
     fi
   fi
   evaluate "http_${code}" "$triggered" "$alert_text" \
-    "HTTP ${code} is back under threshold (${count} in ${WINDOW_LABEL}, threshold ${threshold})"
+    "${label} responses are back under the alert level (${count} in ${WINDOW_LABEL}, alerts above ${threshold})"
 done
 
 if [[ "$CHECK_KERNEL" == true && -n "$KERNEL_SOURCE_USED" ]]; then
@@ -470,10 +543,14 @@ if [[ "$CHECK_KERNEL" == true && -n "$KERNEL_SOURCE_USED" ]]; then
   alert_text=""
   if (( KERNEL_FAULTS >= KERNEL_FAULT_THRESHOLD )); then
     triggered=true
-    alert_text="*${KERNEL_FAULT_PROCESS} crashes*: ${SEGFAULTS} segfault(s) and ${GPFS} general protection fault(s) in ${WINDOW_LABEL} (threshold ${KERNEL_FAULT_THRESHOLD})"$'\n'"\`\`\`$(head -n 3 "$KERNEL_LINES" | cut -c1-220)\`\`\`"
+    alert_text="*\`${KERNEL_FAULT_PROCESS}\` process crashes*: ${KERNEL_FAULTS} in ${WINDOW_LABEL} (alerts at ${KERNEL_FAULT_THRESHOLD} or more): ${SEGFAULTS} segmentation fault(s), ${GPFS} general protection fault(s)"
+    if [[ "$KERNEL_FAULT_PROCESS" == php* ]]; then
+      alert_text+=$'\n'"_The PHP processes that run the site's code are crashing, usually because of a buggy PHP extension or a memory problem. Visitors may see 502 errors or blank pages._"
+    fi
+    alert_text+=$'\n'"Kernel log excerpt:"$'\n'"\`\`\`$(head -n 3 "$KERNEL_LINES" | cut -c1-220)\`\`\`"
   fi
   evaluate "kernel_faults" "$triggered" "$alert_text" \
-    "No more ${KERNEL_FAULT_PROCESS} segfaults/general protection faults over threshold (${KERNEL_FAULTS} in ${WINDOW_LABEL})"
+    "\`${KERNEL_FAULT_PROCESS}\` crashes are back under the alert level (${KERNEL_FAULTS} in ${WINDOW_LABEL})"
 fi
 
 # A monitor watching nothing should say so rather than stay silently green.
@@ -518,9 +595,8 @@ if [[ "$DRY_RUN" == true ]]; then
   exit 0
 fi
 
-HOST="$(hostname)"
 if (( ${#ALERTS[@]} > 0 )); then
-  msg=":rotating_light: *${SITE_LABEL}* (${HOST}): server error monitor"
+  msg=":rotating_light: *${SITE_LABEL}*: server error alert"
   for a in "${ALERTS[@]}"; do
     msg+=$'\n\n'"$a"
   done
@@ -532,7 +608,7 @@ if (( ${#ALERTS[@]} > 0 )); then
 fi
 
 if (( ${#RECOVERIES[@]} > 0 )); then
-  msg=":white_check_mark: *${SITE_LABEL}* (${HOST}): recovered"
+  msg=":white_check_mark: *${SITE_LABEL}*: back to normal"
   for r in "${RECOVERIES[@]}"; do
     msg+=$'\n'"• $r"
   done
