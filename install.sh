@@ -19,6 +19,10 @@
 # Running it again pulls the latest code and re-runs setup (it asks before
 # overwriting an existing .env).
 #
+# With no questions (many servers at once, see fleet-install.sh): the webhook
+# comes from the environment and everything else is auto-detected:
+#   sudo SLACK_WEBHOOK_URL=... bash install-server-error-monitor.sh --non-interactive
+#
 # Override the directory with:
 #   sudo SERVER_ERROR_MONITOR_DIR=/opt/some-other-dir bash install-server-error-monitor.sh
 #
@@ -58,4 +62,4 @@ chmod +x "$TARGET_DIR/setup.sh" "$TARGET_DIR/bin/check-server-errors.sh"
 mkdir -p "$TARGET_DIR/logs" "$TARGET_DIR/state"
 chmod 700 "$TARGET_DIR/state"
 
-exec "$TARGET_DIR/setup.sh"
+exec "$TARGET_DIR/setup.sh" "$@"
