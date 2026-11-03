@@ -32,35 +32,35 @@ v bots.test 198.51.100.3 POST /wp-login.php 403 199 "https://bots.test/wp-login.
 v bots.test 198.51.100.4 POST /wp-admin/admin-ajax.php 403 199 "https://bots.test/" "Mozilla/5.0 (compatible; l9scan/2.0; +https://leakix.net)"
 v nonce.test 203.0.113.8 POST /wp-admin/admin-ajax.php 403 2 "https://nonce.test/" "$PH"
 $C; s=$(slack)
-has "F1: admin-ajax POST with Referer refused: alert" "$s" "Form POSTs refused (403) on learn.test"
-has "F2: POST to a page with Referer refused: alert" "$s" "Form POSTs refused (403) on page.test"
-has "F3: Gravity Forms REST submission refused: alert" "$s" "Form POSTs refused (403) on gf.test"
+has "F1: admin-ajax POST with Referer refused: alert" "$s" "403 Forbidden on form submissions at learn.test"
+has "F2: POST to a page with Referer refused: alert" "$s" "403 Forbidden on form submissions at page.test"
+has "F3: Gravity Forms REST submission refused: alert" "$s" "403 Forbidden on form submissions at gf.test"
 lacks "F4: bot POSTs (no Referer, xmlrpc, wp-login, self-named agent): no alert" "$s" "bots.test"
 lacks "F5: WordPress 2-byte reply (stale nonce): no alert" "$s" "nonce.test"
-has "F6: the alert says what it means" "$s" "visitors cannot submit the form"
+has "F6: the alert says what it means" "$s" "those submissions did not go through"
 : > /tmp/slack.log
 echo "-- cooldown and recovery"
 v learn.test 203.0.113.5 POST /wp-admin/admin-ajax.php 403 162 "https://learn.test/apply/" "$PH"
 $C; lacks "F7: still refused next run: no repeat within the cooldown" "$(slack)" "learn.test"
-$C; lacks "F8: one clean run: no recovery yet (RECOVERY_RUNS=2)" "$(slack)" "Form POSTs on learn.test are no longer refused"
-$C; has "F8: two clean runs: recovery" "$(slack)" "Form POSTs on learn.test are no longer refused"
+$C; lacks "F8: one clean run: no recovery yet (RECOVERY_RUNS=2)" "$(slack)" "Form submissions on learn.test are no longer refused"
+$C; has "F8: two clean runs: recovery" "$(slack)" "Form submissions on learn.test are no longer refused"
 : > /tmp/slack.log
 echo "-- 403 spike: visitors refused, not scanner probes"
 for i in $(seq 60); do v spike.test 192.0.2.$(( i % 5 + 1 )) GET /programs/ 403 199 "-" "$PH"; done
 for i in $(seq 60); do v spike.test 192.0.2.$(( i % 5 + 1 )) GET /.env 403 199 "-" "$PH"; done
 for i in $(seq 60); do v spike.test 192.0.2.$(( i % 5 + 1 )) GET /wp-login.php 403 199 "-" "$PH"; done
 $C; s=$(slack)
-has "S1: 60 page 403s from 5 clients: spike alert, probes not counted" "$s" "HTTP 403 refusing visitors*: 60 in"
-has "S1: ... names the clients" "$s" "from 5 clients"
+has "S1: 60 page 403s from 5 clients: spike alert, probes not counted" "$s" "403 Forbidden for visitors*: 60 responses in"
+has "S1: ... names the clients" "$s" "from 5 IP addresses"
 : > /tmp/slack.log; $C; $C; : > /tmp/slack.log
 for i in $(seq 60); do v onebot.test 192.0.2.9 GET /programs/ 403 199 "-" "$PH"; done
-$C; lacks "S2: 60 page 403s from one client: no spike" "$(slack)" "refusing visitors"
+$C; lacks "S2: 60 page 403s from one client: no spike" "$(slack)" "403 Forbidden for visitors"
 for i in $(seq 200); do v probes.test 192.0.2.$(( i % 9 + 1 )) GET /.git/config 403 199 "-" "$PH"; done
-$C; lacks "S3: 200 scanner-path 403s from 9 clients: no spike" "$(slack)" "refusing visitors"
+$C; lacks "S3: 200 scanner-path 403s from 9 clients: no spike" "$(slack)" "403 Forbidden for visitors"
 : > /tmp/slack.log
 echo "-- what it did before still works"
 for i in $(seq 60); do v err.test 192.0.2.$(( i % 5 + 1 )) GET /programs/ 502 157 "-" "$PH"; done
-$C; has "R1: 60 x 502: the existing HTTP error alert" "$(slack)" "*HTTP 502*: 60 in"
+$C; has "R1: 60 x 502: the existing HTTP error alert" "$(slack)" "*502 Bad Gateway*: 60 responses in"
 out=$($D/bin/check-server-errors.sh --env $D/.env --dry-run)
 has "R2: dry run shows the 403 counts" "$out" "403s: 0 refused form POST(s)"
 has "R3: the run log has the 403 counts" "$(tail -3 $D/logs/server-error-monitor.log)" "403: form="

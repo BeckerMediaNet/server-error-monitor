@@ -37,7 +37,7 @@ That command:
 1. Clones this repo into `/opt/server-error-monitor` (or pulls the latest if
    it's already there).
 2. Hands off to `setup.sh`, which asks for:
-   - a server label for Slack messages and the Slack webhook URL
+   - a site URL for the top of Slack messages and the Slack webhook URL
    - which **Docker containers** to watch, if Docker is running. It lists the
      running containers and suggests the reverse proxy (`nginx-proxy`,
      `traefik`) if there is one; see [Docker](#docker) below.
@@ -68,7 +68,8 @@ a machine that can SSH to them as root (or a user with passwordless sudo):
 
 Each server runs `install.sh --non-interactive`: access logs and containers
 are auto-detected, the label is the DigitalOcean droplet name (else the
-hostname), a server with no web access logs or containers is skipped, and a
+hostname), since one server often hosts many sites and the alert's "Sites
+affected" line names them, a server with no web access logs or containers is skipped, and a
 server that already has an `.env` keeps it and just gets the latest code. The
 webhook goes over ssh's stdin, never on a command line. For one server:
 `sudo SLACK_WEBHOOK_URL=... bash install-server-error-monitor.sh --non-interactive`
@@ -98,10 +99,26 @@ monitor logs a warning, and the setup dry run shows it.
 `5xx`, `5xx,404,429`. Each code is counted and thresholded separately.
 `THRESHOLD_<code>` lines in `.env` override `ERROR_THRESHOLD` for one code.
 
-The alert lists the busiest paths (query strings dropped) and client IPs.
-It also lists the sites, when the log format includes the hostname (as
-nginx-proxy's `vhost` format and Apache's `vhost_combined` do). When several
-logs are watched, it shows which one the errors came from.
+Each alert gives the code's name, a one-line plain-English explanation of
+what it means, and the busiest URLs (query strings dropped) and visitor IPs.
+When most of the errors come from one IP, the alert says it's likely a bot or
+scanner. The alert also lists the sites, when the log format includes the
+hostname (as nginx-proxy's `vhost` format and Apache's `vhost_combined` do).
+Requests sent to the server's bare IP address are marked as such, since
+they're almost always bots. When several logs are watched, the alert shows
+which one the errors came from.
+
+Example:
+
+```
+🚨 aai.edu: server error alert
+
+503 Service Unavailable: 81 responses in the last 5 minutes (alerts above 50)
+The server turned these requests away: it was overloaded or in maintenance mode, or no site is set up for the address that was requested.
+• Sites affected: `64.23.213.183` (81, the server IP, not a site name). Requests to the bare server IP are almost always bots scanning the internet, not real visitors.
+• Most-requested URLs: `/wrangler.toml` (1), `/vultr.json` (1), `/vercel.json` (1), `/tencent.json` (1), `/service_account.json` (1) and 76 other URLs
+• Visitor IP addresses: `85.155.14.16` (81). 100% came from one IP, so this is most likely a single bot or scanner.
+```
 
 **Kernel log**: it uses the systemd journal (`journalctl -k --since
 @<last run>`) when available, otherwise `/var/log/kern.log` or
@@ -187,7 +204,7 @@ set `DOCKER_CONTAINERS=nginx-proxy`. The proxy sees every request for
 every site, and it's the only place the 502/503s show up when a site's
 `httpd` or `php` container is down or unhealthy. Adding
 `aai_production_httpd` as well would count each request twice and halve
-the effective threshold. The alert's "Top sites" line shows which site
+the effective threshold. The alert's "Sites affected" line shows which site
 the errors are for.
 
 php-fpm crashes inside containers need nothing extra: containers share the
@@ -254,7 +271,7 @@ git push -u origin main
   easily produce 50+ 404s in 5 minutes. If you monitor `4xx` or `404`, give
   it its own higher threshold (`THRESHOLD_404=300`).
 - **One busy site can mask another**: the thresholds are per code across
-  all watched logs combined. The "Top sites" / "Logs" lines in the alert
+  all watched logs combined. The "Sites affected" / "Found in logs" lines in the alert
   show where the errors came from.
 - The threshold is per run. If cron is stopped for an hour, the next run
   counts the whole hour's worth of new lines.

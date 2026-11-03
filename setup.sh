@@ -147,7 +147,7 @@ if [[ "${SKIP_ENV:-false}" != true ]]; then
   # On DigitalOcean the droplet name says more than the hostname (often just "bm" here).
   DEFAULT_LABEL="$(curl -fs -m 2 http://169.254.169.254/metadata/v1/hostname 2>/dev/null || true)"
   DEFAULT_LABEL="${DEFAULT_LABEL:-$(hostname)}"
-  ask SITE_LABEL "Server label for Slack messages (e.g. 'Acme Co - web01') [${DEFAULT_LABEL}]: " "$DEFAULT_LABEL"
+  ask SITE_LABEL "Site URL for Slack messages (e.g. 'acme.com') [${DEFAULT_LABEL}]: " "$DEFAULT_LABEL"
   ask_required SLACK_WEBHOOK_URL "Slack Incoming Webhook URL: "
 
   # --- Docker containers ---
