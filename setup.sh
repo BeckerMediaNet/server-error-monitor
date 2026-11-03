@@ -4,7 +4,23 @@
 # directly (from inside the cloned repo) or via install.sh, which clones the
 # repo and calls this automatically.
 #
+# setup.sh --non-interactive asks nothing, for installing on many servers at
+# once (see fleet-install.sh): each answer comes from an environment variable
+# named like the .env setting (SLACK_WEBHOOK_URL is required), otherwise the
+# default, i.e. what pressing ENTER would pick: auto-detected access logs and
+# containers. An existing .env is kept. A server with no web access logs and no
+# containers is skipped. No Slack test message unless DO_TEST=y.
+#
 set -uo pipefail
+
+NONINTERACTIVE=false
+[[ "${1:-}" == --non-interactive ]] && NONINTERACTIVE=true
+declare -A PRESET=()
+for v in SITE_LABEL SLACK_WEBHOOK_URL DOCKER_CONTAINERS ACCESS_LOGS ERROR_CODES ERROR_THRESHOLD THRESHOLD_OVERRIDES \
+         KERNEL_ANSWER KERNEL_FAULT_THRESHOLD ALERT_COOLDOWN_MINUTES OVERWRITE DO_TEST \
+         DO_CRON; do
+  [[ -n "${!v+x}" ]] && PRESET[$v]="${!v}"
+done
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ENV_FILE="$ROOT_DIR/.env"
@@ -23,12 +39,25 @@ no_terminal() {
   exit 1
 }
 
+# not_here <message> — in --non-interactive mode a bad answer can't be asked
+# again, so it stops the setup instead of looping.
+not_here() {
+  echo "$1" >&2
+  exit 1
+}
+
 # ask <varname> <prompt> [default]
 # Wraps `read` so a real read failure (broken/missing terminal) aborts with
 # a clear message instead of silently defaulting or looping forever — only
 # an empty ENTER press falls back to the default.
 ask() {
   local __var="$1" __prompt="$2" __default="${3:-}" __val
+  if [[ "$NONINTERACTIVE" == true ]]; then
+    __val="${PRESET[$__var]-$__default}"
+    echo "${__prompt}${__val}"
+    printf -v "$__var" '%s' "$__val"
+    return
+  fi
   if ! IFS= read -rp "$__prompt" __val; then
     no_terminal
   fi
@@ -40,6 +69,12 @@ ask() {
 # read failure still aborts immediately rather than looping.
 ask_required() {
   local __var="$1" __prompt="$2" __val=""
+  if [[ "$NONINTERACTIVE" == true ]]; then
+    [[ -n "${PRESET[$__var]:-}" ]] || not_here "--non-interactive: set $__var in the environment."
+    echo "${__prompt}(set)"
+    printf -v "$__var" '%s' "${PRESET[$__var]}"
+    return
+  fi
   while [[ -z "$__val" ]]; do
     if ! IFS= read -rp "$__prompt" __val; then
       no_terminal
@@ -55,6 +90,7 @@ ask_number() {
   while :; do
     ask __num "$__prompt" "$__default"
     [[ "$__num" =~ ^[0-9]+$ ]] && break
+    [[ "$NONINTERACTIVE" == true ]] && not_here "--non-interactive: $__var must be a whole number, got '$__num'."
     echo "Please enter a whole number." >&2
   done
   printf -v "$__var" '%s' "$__num"
@@ -64,7 +100,7 @@ ask_number() {
 # carrying the script text itself, not the keyboard. If stdin isn't already
 # an interactive terminal, try switching to the real terminal device — but
 # only when stdin needs it, so a normal, already-interactive run is left alone.
-if [[ ! -t 0 ]] && [[ -r /dev/tty ]]; then
+if [[ "$NONINTERACTIVE" != true ]] && [[ ! -t 0 ]] && [[ -r /dev/tty ]]; then
   exec < /dev/tty
 fi
 
@@ -104,11 +140,21 @@ if [[ -f "$ENV_FILE" ]]; then
   if [[ ! "$OVERWRITE" =~ ^[Yy] ]]; then
     echo "Keeping existing .env. Re-run with that answer set to 'y' to redo it."
     SKIP_ENV=true
+    # Installs before 403 monitoring wrote the old default code list; bring
+    # those up to the new default. A list someone changed is left alone.
+    if grep -Eq '^ERROR_CODES="?500,502,503,504"?$' "$ENV_FILE"; then
+      sed -i -E 's/^ERROR_CODES="?500,502,503,504"?$/ERROR_CODES=403,500,502,503,504/' "$ENV_FILE"
+      echo "Added 403 to ERROR_CODES in .env: visitors refused by a firewall or security plugin,"
+      echo "and refused form POSTs, are now monitored. Remove 403 there to turn that off."
+    fi
   fi
 fi
 
 if [[ "${SKIP_ENV:-false}" != true ]]; then
-  ask SITE_LABEL "Site URL for Slack messages (e.g. 'acme.com') [$(hostname)]: " "$(hostname)"
+  # On DigitalOcean the droplet name says more than the hostname (often just "bm" here).
+  DEFAULT_LABEL="$(curl -fs -m 2 http://169.254.169.254/metadata/v1/hostname 2>/dev/null || true)"
+  DEFAULT_LABEL="${DEFAULT_LABEL:-$(hostname)}"
+  ask SITE_LABEL "Site URL for Slack messages (e.g. 'acme.com') [${DEFAULT_LABEL}]: " "$DEFAULT_LABEL"
   ask_required SLACK_WEBHOOK_URL "Slack Incoming Webhook URL: "
 
   # --- Docker containers ---
@@ -144,6 +190,7 @@ if [[ "${SKIP_ENV:-false}" != true ]]; then
         docker inspect "$name" >/dev/null 2>&1 || BAD+=" $name"
       done
       [[ -z "$BAD" ]] && break
+      [[ "$NONINTERACTIVE" == true ]] && not_here "--non-interactive: no such container:$BAD"
       echo "No such container:$BAD" >&2
     done
   fi
@@ -180,6 +227,10 @@ if [[ "${SKIP_ENV:-false}" != true ]]; then
     if [[ "$ACCESS_LOGS" == none ]]; then
       ACCESS_LOGS=""
       [[ -n "$DOCKER_CONTAINERS" ]] && break
+      if [[ "$NONINTERACTIVE" == true ]]; then
+        echo "Nothing to monitor here (no web access logs or containers found) — not installing."
+        exit 0
+      fi
       echo "No containers were chosen either, so nothing would be monitored — enter at least one log path." >&2
       continue
     fi
@@ -187,6 +238,12 @@ if [[ "${SKIP_ENV:-false}" != true ]]; then
     if [[ -n "$MATCHED" ]]; then
       echo "That matches $(wc -l <<< "$MATCHED" | tr -d ' ') file(s)."
       break
+    fi
+    if [[ "$NONINTERACTIVE" == true ]]; then
+      [[ -n "${PRESET[ACCESS_LOGS]:-}" ]] && break   # a path given on purpose is kept, as with "use it anyway"
+      [[ -n "$DOCKER_CONTAINERS" ]] && { ACCESS_LOGS=""; break; }
+      echo "Nothing to monitor here (no web access logs or containers found) — not installing."
+      exit 0
     fi
     echo "Nothing currently matches '$ACCESS_LOGS'."
     ask KEEP_ANYWAY "Use it anyway (e.g. the log doesn't exist yet)? [y/N]: " "N"
@@ -196,8 +253,10 @@ if [[ "${SKIP_ENV:-false}" != true ]]; then
   # --- HTTP error codes ---
   echo
   echo "Which HTTP status codes should be monitored? Comma-separated exact codes"
-  echo "and/or whole classes, e.g. '500,502,503,504' or '5xx,404,429'."
-  ask ERROR_CODES "Error codes [500,502,503,504]: " "500,502,503,504"
+  echo "and/or whole classes, e.g. '403,500,502,503,504' or '5xx,404,429'. A 403 only"
+  echo "counts when a visitor was refused (scanner probes like /.env or /wp-login.php"
+  echo "never do), and a single refused form POST alerts on its own."
+  ask ERROR_CODES "Error codes [403,500,502,503,504]: " "403,500,502,503,504"
   ERROR_CODES="$(tr -d '[:space:]' <<< "$ERROR_CODES")"
 
   ask_number ERROR_THRESHOLD "Alert when a single code is seen MORE than this many times in one 5-minute run [50]: " "50"
@@ -216,6 +275,7 @@ if [[ "${SKIP_ENV:-false}" != true ]]; then
         THRESHOLD_LINES+="THRESHOLD_${BASH_REMATCH[1]}=${BASH_REMATCH[2]}"$'\n'
       else
         echo "Couldn't understand '$pair' — use code=number, e.g. 404=300." >&2
+        [[ "$NONINTERACTIVE" == true ]] && exit 1
         valid=false
       fi
     done
@@ -261,7 +321,7 @@ chmod +x "$CHECK_SCRIPT"
 mkdir -p "$ROOT_DIR/logs" "$ROOT_DIR/state"
 
 echo
-ask DO_TEST "Send a Slack test message now? [Y/n]: " "Y"
+ask DO_TEST "Send a Slack test message now? [Y/n]: " "$([[ "$NONINTERACTIVE" == true ]] && echo N || echo Y)"
 if [[ ! "${DO_TEST:-Y}" =~ ^[Nn] ]]; then
   "$CHECK_SCRIPT" --env "$ENV_FILE" --test-slack
 fi

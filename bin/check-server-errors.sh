@@ -63,12 +63,14 @@ set +a
 SITE_LABEL="${SITE_LABEL:-$(hostname)}"
 ACCESS_LOGS="${ACCESS_LOGS-/var/log/nginx/*access*log /var/log/apache2/*access*log /var/log/httpd/*access*log}"
 DOCKER_CONTAINERS="${DOCKER_CONTAINERS:-}"
-ERROR_CODES="${ERROR_CODES:-500,502,503,504}"
+ERROR_CODES="${ERROR_CODES:-403,500,502,503,504}"
 ERROR_THRESHOLD="${ERROR_THRESHOLD:-50}"
 CHECK_KERNEL="${CHECK_KERNEL:-true}"
 KERNEL_LOG_SOURCE="${KERNEL_LOG_SOURCE:-auto}"
 KERNEL_FAULT_THRESHOLD="${KERNEL_FAULT_THRESHOLD:-3}"
 KERNEL_FAULT_PROCESS="${KERNEL_FAULT_PROCESS:-php-fpm}"
+FORM_403_CHECK="${FORM_403_CHECK:-true}"
+MIN_CLIENTS_403="${MIN_CLIENTS_403:-3}"
 ALERT_COOLDOWN_MINUTES="${ALERT_COOLDOWN_MINUTES:-60}"
 RECOVERY_RUNS="${RECOVERY_RUNS:-2}"
 TOP_N="${TOP_N:-5}"
@@ -136,8 +138,10 @@ TMP_DIR="$(mktemp -d)"
 trap 'rm -rf "$TMP_DIR"' EXIT
 MATCHES="$TMP_DIR/matches.tsv"   # code<TAB>client<TAB>path<TAB>source<TAB>site, one row per monitored error
 STATS="$TMP_DIR/stats"           # source<TAB>lines<TAB>unparsed, one row per log source
+FORM403="$TMP_DIR/403.tsv"       # form<TAB>client<TAB>path<TAB>source<TAB>site (or source), one row per refused form POST
 : > "$MATCHES"
 : > "$STATS"
+: > "$FORM403"
 
 NOW="$(date +%s)"
 LAST_RUN="$(cat "$LAST_RUN_FILE" 2>/dev/null || echo "")"
@@ -223,9 +227,37 @@ read_new() {
 # those (like the "nginx.1 |" prefix nginx-proxy's process manager adds) and
 # terminal colour codes are ignored. Written for plain POSIX awk (mawk on
 # Debian/Ubuntu) — no gawk extensions.
+#
+# A monitored 403 only counts when a visitor was refused. Each one is sorted:
+#   form   a visitor's form POST was refused: a POST from a browser that carried
+#          the page it came from (Referer) to admin-ajax.php, a form plugin's REST
+#          route, or a page. Bots and scanners send no Referer (checked against
+#          13 servers' logs, 10/29: every real refused form POST had one, no bot
+#          did). WordPress's own 2-byte "-1"/"0" reply on admin-ajax.php is a stale
+#          nonce on a cached page, not a block, and is left out. Also written to
+#          the form file (f403) for the refused-form alert.
+#   visit  any other 403 on a path a visitor could ask for.
+# Anything else is dropped: scanner paths (dot files, .php other than index.php,
+# wp-login, xmlrpc, wp-admin, backups) and POSTs with no Referer, since bots get
+# refused there all day.
 AWK_PARSE='
 function is_ip(s) {
   return s ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/ || s ~ /^[0-9a-fA-F]*:[0-9a-fA-F]*:[0-9a-fA-F:.]*$/
+}
+function kind403(method, url, after, ua, ref,   lp, qs, j, bytes, endpoint, page, browser) {
+  lp = tolower(url); qs = ""
+  j = index(lp, "?"); if (j > 0) { qs = substr(lp, j + 1); lp = substr(lp, 1, j - 1) }
+  bytes = after; sub(/ .*/, "", bytes); if (bytes == "-") bytes = 0
+  endpoint = (lp == "/wp-admin/admin-ajax.php" || ((lp ~ /^\/wp-json\// || qs ~ /(^|&)rest_route=/) && (lp "?" qs) ~ /(\/|=%2f|=\/)(gf|gravityforms|contact-form-7|wpforms|frm|ninja-forms|forminator)(\/|%2f)/))
+  page = !(lp ~ /^\/wp-(admin|content|includes|json)(\/|$)/ || lp ~ /\/\./ || (lp ~ /\.[a-z0-9]+$/ && lp !~ /\/index\.php$/ && lp !~ /\.html?$/))
+  browser = (ua ~ /Mozilla\// && tolower(ua) !~ /compatible[;)]|\+https?:\/\/|headless/)
+  if (method == "POST" && browser && ref != "" && ref != "-" && (endpoint || page) && !(lp == "/wp-admin/admin-ajax.php" && bytes + 0 <= 2)) return "form"
+  if (lp ~ /\/\./ || lp ~ /(^|\/)(xmlrpc|wp-login|wp-cron|wp-trackback|wp-comments-post|wp-signup|wp-activate)\.php$/) return ""
+  if (lp ~ /\.php$/ && lp !~ /(^|\/)index\.php$/ && lp != "/wp-admin/admin-ajax.php") return ""
+  if (lp ~ /^\/wp-admin(\/|$)/ && lp != "/wp-admin/admin-ajax.php") return ""
+  if (lp ~ /\.(bak|old|orig|sql|zip|tar|gz|tgz|rar|7z|env|ini|log|swp|yml|yaml|conf|config)$/) return ""
+  if (method == "POST" && !(browser && ref != "" && ref != "-")) return ""
+  return "visit"
 }
 BEGIN {
   n = split(codes, list, ",")
@@ -244,11 +276,14 @@ NF == 0 { next }
   total++
   if (!match($0, /" [1-5][0-9][0-9] /)) { unparsed++; next }
   code = substr($0, RSTART + 2, 3)
-  if (!(code in exact) && !(substr(code, 1, 1) in cls)) next
+  watched = (code in exact) || (substr(code, 1, 1) in cls)
+  if (!watched) next
+  after = substr($0, RSTART + RLENGTH)
   q = index($0, "\"")
   req = substr($0, q + 1, RSTART - q - 1)
   split(req, parts, " ")
-  path = (parts[2] != "") ? parts[2] : req
+  url = (parts[2] != "") ? parts[2] : req
+  path = url
   sub(/\?.*/, "", path)
   if (length(path) > 100) path = substr(path, 1, 100) "..."
   client = $1; site = ""; ci = 0
@@ -261,6 +296,18 @@ NF == 0 { next }
       s = $(ci - 1); sub(/:[0-9]+$/, "", s)
       if (s !~ /[|]/ && s ~ /\./ && (s ~ /[A-Za-z]/ || is_ip(s))) site = s
     }
+  }
+  if (code == "403") {
+    ref = ""; ua = ""; rest = after; nq = 0
+    while (match(rest, /"[^"]*"/)) {
+      nq++
+      if (nq == 1) ref = substr(rest, RSTART + 1, RLENGTH - 2)
+      else { ua = substr(rest, RSTART + 1, RLENGTH - 2); break }
+      rest = substr(rest, RSTART + RLENGTH)
+    }
+    k = kind403(parts[1], url, after, ua, ref)
+    if (k == "") next
+    if (k == "form" && f403 != "") print k "\t" client "\t" path "\t" src "\t" (site != "" ? site : src) >> f403
   }
   print code "\t" client "\t" path "\t" src "\t" site
 }
@@ -285,7 +332,7 @@ done
 shopt -u nullglob
 
 for f in ${LOG_FILES[@]+"${LOG_FILES[@]}"}; do
-  read_new "$f" | awk -v codes="$ERROR_CODES" -v src="$f" -v stats="$STATS" "$AWK_PARSE" >> "$MATCHES"
+  read_new "$f" | awk -v codes="$ERROR_CODES" -v src="$f" -v stats="$STATS" -v f403="$FORM403" "$AWK_PARSE" >> "$MATCHES"
 done
 
 # read_container <name>
@@ -334,7 +381,7 @@ fi
 for name in $DOCKER_CONTAINERS; do
   if command -v docker >/dev/null 2>&1 && docker inspect "$name" >/dev/null 2>&1; then
     CONTAINERS+=("$name")
-    read_container "$name" | awk -v codes="$ERROR_CODES" -v src="docker:$name" -v stats="$STATS" "$AWK_PARSE" >> "$MATCHES"
+    read_container "$name" | awk -v codes="$ERROR_CODES" -v src="docker:$name" -v stats="$STATS" -v f403="$FORM403" "$AWK_PARSE" >> "$MATCHES"
   else
     say "Container $name not found"
     MISSING_CONTAINERS+=("$name")
@@ -363,13 +410,17 @@ threshold_for() {
   printf '%s' "${!var:-$ERROR_THRESHOLD}"
 }
 
-# top_list <code> <column> <noun> — "`value` (count), ... and N other <noun>s"
-# for the busiest values. A bare IPv4 address in the site column is flagged,
-# since it means the request didn't name a site at all.
+# top_list <file> <kind regex> <column> <noun> [site] — "`value` (count), ...
+# and N other <noun>s" for the busiest values in one column of a match file
+# (MATCHES or FORM403), over the rows whose first column matches <kind regex>
+# and, if given, whose site (or log, when no site was recorded) is [site]. A
+# bare IPv4 address in the site column is flagged, since it means the request
+# didn't name a site at all.
 top_list() {
-  awk -F'\t' -v c="$1" -v col="$2" '$1 == c && $col != "" { print $col }' "$MATCHES" \
+  awk -F'\t' -v k="$2" -v col="$3" -v s="${5:-}" \
+    '$1 ~ k && (s == "" || ($5 != "" ? $5 : $4) == s) && $col != "" { print $col }' "$1" \
     | sort | uniq -c | sort -rn \
-    | awk -v top="$TOP_N" -v noun="$3" -v site_col="$([[ $2 == 5 ]] && echo 1 || echo 0)" '
+    | awk -v top="$TOP_N" -v noun="$4" -v site_col="$([[ $3 == 5 ]] && echo 1 || echo 0)" '
         NR <= top {
           n = $1; $1 = ""; sub(/^ /, "")
           note = (site_col && $0 ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/) ? ", the server IP, not a site name" : ""
@@ -504,6 +555,12 @@ for f in "$STATE_DIR"/alert_http_*; do
   [[ -f "$f" ]] && CODES_TO_EVALUATE+=("${f##*alert_http_}")
 done
 
+# 403s also need MIN_CLIENTS_403 different clients, so one bot hammering a
+# page doesn't alert.
+CLIENTS_403=$(awk -F'\t' '$1 == "403" { print $2 }' "$MATCHES" | sort -u | wc -l)
+FORM403_COUNT=$(wc -l < "$FORM403")
+HTTP403_OVER=false
+
 SUMMARY=""
 (( SOURCE_COUNT == 0 )) && CODES_TO_EVALUATE=()
 for code in $(printf '%s\n' ${CODES_TO_EVALUATE[@]+"${CODES_TO_EVALUATE[@]}"} | sort -u); do
@@ -514,43 +571,86 @@ for code in $(printf '%s\n' ${CODES_TO_EVALUATE[@]+"${CODES_TO_EVALUATE[@]}"} | 
   label="${label% }"
   triggered=false
   alert_text=""
-  if (( count > threshold )); then
+  over=false
+  (( count > threshold )) && over=true
+  [[ "$code" == 403 ]] && (( CLIENTS_403 < MIN_CLIENTS_403 )) && over=false
+  if [[ "$over" == true ]]; then
     triggered=true
-    alert_text="*${label}*: ${count} responses in ${WINDOW_LABEL} (alerts above ${threshold})"
+    if [[ "$code" == 403 ]]; then
+      HTTP403_OVER=true
+      alert_text="*HTTP ${label}*: ${count} in ${WINDOW_LABEL} from ${CLIENTS_403} clients (threshold ${threshold}; scanner paths not counted)"
+    else
+      alert_text="*HTTP ${label}*: ${count} in ${WINDOW_LABEL} (threshold ${threshold})"
+    fi
     meaning="$(code_meaning "$code")"
     [[ -n "$meaning" ]] && alert_text+=$'\n'"_${meaning}_"
-    sites="$(top_list "$code" 5 site)"
+    sites="$(top_list "$MATCHES" "^${code}\$" 5 site)"
     if [[ -n "$sites" ]]; then
-      alert_text+=$'\n'"• Sites affected: ${sites}"
+      alert_text+=$'\n'"• Top sites: ${sites}"
       [[ "$sites" == *"the server IP, not a site name"* ]] && \
         alert_text+=". Requests to the bare server IP are almost always bots scanning the internet, not real visitors."
     fi
-    alert_text+=$'\n'"• Most-requested URLs: $(top_list "$code" 3 URL)"
-    alert_text+=$'\n'"• Visitor IP addresses: $(top_list "$code" 2 IP)"
+    alert_text+=$'\n'"• Top paths: $(top_list "$MATCHES" "^${code}\$" 3 path)"
+    alert_text+=$'\n'"• Top clients: $(top_list "$MATCHES" "^${code}\$" 2 client)"
     share="$(top_share "$code" 2)"
     (( count >= 20 && share >= 80 )) && \
-      alert_text+=". ${share}% came from one IP, so this is most likely a single bot or scanner."
+      alert_text+=". ${share}% came from one client, so this is most likely a single bot or scanner."
     if (( SOURCE_COUNT > 1 )); then
-      alert_text+=$'\n'"• Found in logs: $(top_list "$code" 4 log)"
+      alert_text+=$'\n'"• Top logs: $(top_list "$MATCHES" "^${code}\$" 4 log)"
+    fi
+    if [[ "$code" == 403 && "$FORM_403_CHECK" == true ]] && (( FORM403_COUNT > 0 )); then
+      alert_text+=$'\n'"• Refused form POSTs: $(top_list "$FORM403" '^form$' 5 site)"
     fi
   fi
   evaluate "http_${code}" "$triggered" "$alert_text" \
-    "${label} responses are back under the alert level (${count} in ${WINDOW_LABEL}, alerts above ${threshold})"
+    "HTTP ${label} is back under threshold (${count} in ${WINDOW_LABEL}, threshold ${threshold})"
 done
+
+# --- refused form POSTs ------------------------------------------------------
+# A form POST refused with a 403 means a visitor could not send the form, so a
+# single one alerts, per site (same cooldown and recovery as everything else).
+# Only while 403 is monitored (FORM403 is empty otherwise). While the 403 alert
+# above is firing, the refused forms are listed in it instead, so one block is
+# never reported twice.
+if [[ "$FORM_403_CHECK" == true && "$HTTP403_OVER" != true ]] && (( SOURCE_COUNT > 0 )); then
+  FORM_SITES=()
+  while IFS= read -r s; do
+    [[ -n "$s" ]] && FORM_SITES+=("$s")
+  done < <(cut -f5 "$FORM403" | sort -u)
+  for f in "$STATE_DIR"/alert_form403_*; do   # sites alerting last time, so they can recover
+    [[ -f "$f" && -f "$f.site" ]] && FORM_SITES+=("$(cat "$f.site")")
+  done
+  for s in $(printf '%s\n' ${FORM_SITES[@]+"${FORM_SITES[@]}"} | sort -u); do
+    count=$(awk -F'\t' -v s="$s" '$5 == s' "$FORM403" | wc -l)
+    key="form403_$(state_key "$s")"
+    triggered=false
+    alert_text=""
+    if (( count > 0 )); then
+      triggered=true
+      alert_text="*Form POSTs refused (403) on ${s}*: ${count} in ${WINDOW_LABEL}, visitors cannot submit the form"
+      alert_text+=$'\n'"_Visitors sent a form on this site and were refused, so those submissions did not go through._"
+      alert_text+=$'\n'"• Top paths: $(top_list "$FORM403" '^form$' 3 path "$s")"
+      alert_text+=$'\n'"• Top clients: $(top_list "$FORM403" '^form$' 2 client "$s")"
+      write_state "$STATE_DIR/alert_${key}.site" "$s"
+    fi
+    evaluate "$key" "$triggered" "$alert_text" "Form POSTs on ${s} are no longer refused (none in ${WINDOW_LABEL})"
+    [[ -f "$STATE_DIR/alert_${key}" || "$DRY_RUN" == true ]] || rm -f "$STATE_DIR/alert_${key}.site"
+  done
+fi
 
 if [[ "$CHECK_KERNEL" == true && -n "$KERNEL_SOURCE_USED" ]]; then
   triggered=false
   alert_text=""
   if (( KERNEL_FAULTS >= KERNEL_FAULT_THRESHOLD )); then
     triggered=true
-    alert_text="*\`${KERNEL_FAULT_PROCESS}\` process crashes*: ${KERNEL_FAULTS} in ${WINDOW_LABEL} (alerts at ${KERNEL_FAULT_THRESHOLD} or more): ${SEGFAULTS} segmentation fault(s), ${GPFS} general protection fault(s)"
+    alert_text="*\`${KERNEL_FAULT_PROCESS}\` process crashes*: ${KERNEL_FAULTS} in ${WINDOW_LABEL} (threshold ${KERNEL_FAULT_THRESHOLD}): ${SEGFAULTS} segmentation fault(s), ${GPFS} general protection fault(s)"
     if [[ "$KERNEL_FAULT_PROCESS" == php* ]]; then
       alert_text+=$'\n'"_The PHP processes that run the site's code are crashing, usually because of a buggy PHP extension or a memory problem. Visitors may see 502 errors or blank pages._"
     fi
     alert_text+=$'\n'"Kernel log excerpt:"$'\n'"\`\`\`$(head -n 3 "$KERNEL_LINES" | cut -c1-220)\`\`\`"
   fi
   evaluate "kernel_faults" "$triggered" "$alert_text" \
-    "\`${KERNEL_FAULT_PROCESS}\` crashes are back under the alert level (${KERNEL_FAULTS} in ${WINDOW_LABEL})"
+    "\`${KERNEL_FAULT_PROCESS}\` crashes are back under threshold (${KERNEL_FAULTS} in ${WINDOW_LABEL}, threshold ${KERNEL_FAULT_THRESHOLD})"
 fi
 
 # A monitor watching nothing should say so rather than stay silently green.
@@ -575,7 +675,7 @@ for name in $DOCKER_CONTAINERS; do
     "Container \`${name}\` is back — monitoring its access log again"
 done
 
-log "Checked ${SOURCE_COUNT} log source(s), ${TOTAL_LINES} lines (${TOTAL_UNPARSED} unparsed); codes:${SUMMARY:- none}; kernel(${KERNEL_SOURCE_USED:-off}): segfault=${SEGFAULTS} gpf=${GPFS}"
+log "Checked ${SOURCE_COUNT} log source(s), ${TOTAL_LINES} lines (${TOTAL_UNPARSED} unparsed); codes:${SUMMARY:- none}; 403: form=${FORM403_COUNT} clients=${CLIENTS_403}; kernel(${KERNEL_SOURCE_USED:-off}): segfault=${SEGFAULTS} gpf=${GPFS}"
 
 # --- report -----------------------------------------------------------------
 if [[ "$DRY_RUN" == true ]]; then
@@ -584,8 +684,12 @@ if [[ "$DRY_RUN" == true ]]; then
     echo "  $src — $lines lines read, $unparsed without a recognisable status code"
   done < "$STATS"
   echo "Monitored codes (${ERROR_CODES}) seen:${SUMMARY:- none}"
+  if [[ ",$(tr -d '[:space:]' <<< "$ERROR_CODES" | tr 'X' 'x')," =~ ,(403|4xx), ]]; then
+    echo "403s: ${FORM403_COUNT} refused form POST(s), ${CODE_COUNT[403]:-0} refused visitor request(s) in all from ${CLIENTS_403} client(s) (scanner paths not counted)"
+  fi
   for code in $(printf '%s\n' ${CODE_COUNT[@]+"${!CODE_COUNT[@]}"} | sort); do
     threshold="$(threshold_for "$code")"
+    [[ "$code" == 403 ]] && (( CLIENTS_403 < MIN_CLIENTS_403 )) && continue
     (( CODE_COUNT[$code] > threshold )) && echo "  $code is OVER its threshold of $threshold"
   done
   if [[ "$CHECK_KERNEL" == true ]]; then

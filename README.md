@@ -3,8 +3,12 @@
 Server-level watchdog that posts to Slack when:
 
 - **HTTP errors spike.** Any single monitored status code (default
-  `500,502,503,504`) shows up **more than 50 times** in the web server access
-  logs since the previous run.
+  `403,500,502,503,504`) shows up **more than 50 times** in the web server
+  access logs since the previous run. A 403 only counts when a visitor was
+  refused, from at least 3 clients: scanner paths (`/.env`, `/wp-login.php`,
+  ...) never count (see [403s](#403s)).
+- **A form POST is refused (403).** Any one: a visitor could not send the
+  form. Per site. Bots and scanners don't count.
 - **php-fpm is crashing.** The kernel log shows **3 or more** php-fpm
   segfaults / general protection faults (combined) since the previous run.
 
@@ -32,7 +36,8 @@ That command:
 1. Clones this repo into `/opt/server-error-monitor` (or pulls the latest if
    it's already there).
 2. Hands off to `setup.sh`, which asks for:
-   - a server label for Slack messages and the Slack webhook URL
+   - the site URL for Slack messages (defaults to the DigitalOcean droplet
+     name, else the hostname) and the Slack webhook URL
    - which **Docker containers** to watch, if Docker is running. It lists the
      running containers and suggests the reverse proxy (`nginx-proxy`,
      `traefik`) if there is one; see [Docker](#docker) below.
@@ -52,6 +57,22 @@ That command:
 
 Re-running the same command later pulls the latest code and re-runs setup
 (it asks before overwriting an existing `.env`).
+
+**On many servers at once**, with no questions: put the servers in a file
+(one `[user@]host` per line) and the Slack webhook URL in another, then from
+a machine that can SSH to them as root (or a user with passwordless sudo):
+
+```bash
+./fleet-install.sh servers.txt webhook.txt
+```
+
+Each server runs `install.sh --non-interactive`: access logs and containers
+are auto-detected, the Slack label (`SITE_LABEL`) is the DigitalOcean droplet
+name (else the hostname) unless you pass `SITE_LABEL=...`, a server with no web access logs or containers is skipped, and a
+server that already has an `.env` keeps it and just gets the latest code. The
+webhook goes over ssh's stdin, never on a command line. For one server:
+`sudo SLACK_WEBHOOK_URL=... bash install-server-error-monitor.sh --non-interactive`
+(any other `.env` setting can be given the same way).
 
 ## How it works
 
@@ -91,11 +112,11 @@ Example:
 ```
 🚨 aai.edu: server error alert
 
-503 Service Unavailable: 81 responses in the last 5 minutes (alerts above 50)
+HTTP 503 Service Unavailable: 81 in the last 5 minutes (threshold 50)
 The server turned these requests away: it was overloaded or in maintenance mode, or no site is set up for the address that was requested.
-• Sites affected: `64.23.213.183` (81, the server IP, not a site name). Requests to the bare server IP are almost always bots scanning the internet, not real visitors.
-• Most-requested URLs: `/wrangler.toml` (1), `/vultr.json` (1), `/vercel.json` (1), `/tencent.json` (1), `/service_account.json` (1) and 76 other URLs
-• Visitor IP addresses: `85.155.14.16` (81). 100% came from one IP, so this is most likely a single bot or scanner.
+• Top sites: `64.23.213.183` (81, the server IP, not a site name). Requests to the bare server IP are almost always bots scanning the internet, not real visitors.
+• Top paths: `/wrangler.toml` (1), `/vultr.json` (1), `/vercel.json` (1), `/tencent.json` (1), `/service_account.json` (1) and 76 other paths
+• Top clients: `85.155.14.16` (81). 100% came from one client, so this is most likely a single bot or scanner.
 ```
 
 **Kernel log**: it uses the systemd journal (`journalctl -k --since
@@ -121,6 +142,40 @@ reboot are not counted after it.
   never sits silently green while watching nothing.
 
 A lock (`flock`) stops a slow run from overlapping the next cron tick.
+
+## 403s
+
+403 is in the default `ERROR_CODES`, but unlike the other codes only 403s that
+refused a visitor are counted. Each one is sorted:
+
+- **Refused form POST**: a `POST` from a browser (`Mozilla/` agent, not one
+  that names itself a bot: `compatible;`, a `+http` link, `headless`) that
+  carried the page it came from (`Referer`), to `admin-ajax.php`, a form
+  plugin's REST route (Gravity Forms, Contact Form 7, WPForms, Formidable,
+  Ninja Forms, Forminator) or a page. One is enough to alert, per site, with
+  the usual cooldown and recovery. A bot or scanner POST carries no Referer:
+  on 10/29, across 13 servers, every real refused form POST had one and no bot
+  did. WordPress answering `admin-ajax.php` with its 2-byte `-1`/`0` (a stale
+  nonce on a cached page) is not a block and is left out.
+- **Visitor refused**: any other 403 on a path a visitor could ask for.
+- **Not counted at all**: scanner paths, where bots get refused all day: dot
+  files (`/.env`, `/.git/`), `.php` files other than `index.php`,
+  `wp-login.php`, `xmlrpc.php`, `/wp-admin/`, backups and archives, and POSTs
+  with no Referer.
+
+The counted 403s (form POSTs and visitors) alert like any other code, above
+`THRESHOLD_403` (default `ERROR_THRESHOLD`, 50), but only when they come from
+at least `MIN_CLIENTS_403` (3) different clients, so one bot hammering a page
+doesn't. While that alert is firing, any refused form POSTs are listed in it
+instead of alerting separately, so one block is never reported twice.
+
+To stop monitoring 403s, refused form POSTs included, remove `403` from
+`ERROR_CODES`. `FORM_403_CHECK=false` keeps the count but drops the
+single-form alert. Servers installed before 403 monitoring have
+`ERROR_CODES=500,502,503,504` in their `.env`; re-running the installer (or
+`fleet-install.sh`) adds 403 to exactly that list and leaves any other list
+alone. With Docker, watch the proxy (below): it is the one that logs the 403s
+its sites answer.
 
 ## Docker
 
@@ -158,7 +213,7 @@ set `DOCKER_CONTAINERS=nginx-proxy`. The proxy sees every request for
 every site, and it's the only place the 502/503s show up when a site's
 `httpd` or `php` container is down or unhealthy. Adding
 `aai_production_httpd` as well would count each request twice and halve
-the effective threshold. The alert's "Sites affected" line shows which site
+the effective threshold. The alert's "Top sites" line shows which site
 the errors are for.
 
 php-fpm crashes inside containers need nothing extra: containers share the
@@ -168,6 +223,8 @@ host kernel, so their segfaults land in the host's kernel log.
 
 ```
 install.sh                   one-command entry point (clone/update + hand off to setup.sh)
+fleet-install.sh             install/update on many servers over SSH, no questions
+test/run.sh                  the checks against crafted log lines, in a throwaway container (needs docker)
 setup.sh                     interactive configurator (writes .env, tests Slack, dry run, installs cron)
 bin/check-server-errors.sh   the actual check, run by root's cron every 5 minutes
 .env.example                 reference list of every config value, for manual editing
@@ -196,6 +253,10 @@ tail /opt/server-error-monitor/logs/server-error-monitor.log
 position yet, it reads the last 5 MB of the file (the current boot for the
 journal), which is handy for checking the log format parses.
 
+Automated: `test/run.sh` runs the checks (403 form POSTs, visitor 403s, the
+existing HTTP error alert, cooldown/recovery, `setup.sh --non-interactive`)
+against crafted log lines in a throwaway Debian container with a fake Slack.
+
 To reset everything (e.g. after changing `ACCESS_LOGS`), delete
 `/opt/server-error-monitor/state/`. The next run re-baselines.
 
@@ -219,7 +280,7 @@ git push -u origin main
   easily produce 50+ 404s in 5 minutes. If you monitor `4xx` or `404`, give
   it its own higher threshold (`THRESHOLD_404=300`).
 - **One busy site can mask another**: the thresholds are per code across
-  all watched logs combined. The "Sites affected" / "Found in logs" lines in the alert
+  all watched logs combined. The "Top sites" / "Top logs" lines in the alert
   show where the errors came from.
 - The threshold is per run. If cron is stopped for an hour, the next run
   counts the whole hour's worth of new lines.
