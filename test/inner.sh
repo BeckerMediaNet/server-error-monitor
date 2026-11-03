@@ -45,20 +45,29 @@ $C; lacks "F7: still refused next run: no repeat within the cooldown" "$(slack)"
 $C; lacks "F8: one clean run: no recovery yet (RECOVERY_RUNS=2)" "$(slack)" "Form POSTs on learn.test are no longer refused"
 $C; has "F8: two clean runs: recovery" "$(slack)" "Form POSTs on learn.test are no longer refused"
 : > /tmp/slack.log
-echo "-- 403 spike: visitors refused, not scanner probes"
+echo "-- 403s: visitors refused, not scanner probes"
 for i in $(seq 60); do v spike.test 192.0.2.$(( i % 5 + 1 )) GET /programs/ 403 199 "-" "$PH"; done
 for i in $(seq 60); do v spike.test 192.0.2.$(( i % 5 + 1 )) GET /.env 403 199 "-" "$PH"; done
 for i in $(seq 60); do v spike.test 192.0.2.$(( i % 5 + 1 )) GET /wp-login.php 403 199 "-" "$PH"; done
 $C; s=$(slack)
-has "S1: 60 page 403s from 5 clients: spike alert, probes not counted" "$s" "HTTP 403 refusing visitors*: 60 in"
+has "S1: 60 page 403s from 5 clients: the 403 alert, probes not counted" "$s" "*HTTP 403 Forbidden*: 60 in"
 has "S1: ... names the clients" "$s" "from 5 clients"
 has "S1: ... lists the paths" "$s" "Top paths: \`/programs/\` (60)"
+lacks "S1: ... not the probe paths" "$s" "/wp-login.php"
 : > /tmp/slack.log; $C; $C; : > /tmp/slack.log
 for i in $(seq 60); do v onebot.test 192.0.2.9 GET /programs/ 403 199 "-" "$PH"; done
-$C; lacks "S2: 60 page 403s from one client: no spike" "$(slack)" "refusing visitors"
+$C; lacks "S2: 60 page 403s from one client: no alert" "$(slack)" "HTTP 403"
 for i in $(seq 200); do v probes.test 192.0.2.$(( i % 9 + 1 )) GET /.git/config 403 199 "-" "$PH"; done
-$C; lacks "S3: 200 scanner-path 403s from 9 clients: no spike" "$(slack)" "refusing visitors"
+$C; lacks "S3: 200 scanner-path 403s from 9 clients: no alert" "$(slack)" "HTTP 403"
 : > /tmp/slack.log
+echo "-- a block that refuses pages and forms alike: one alert, not two"
+for i in $(seq 60); do v waf.test 192.0.2.$(( i % 5 + 1 )) GET /programs/ 403 199 "-" "$PH"; done
+v waf.test 203.0.113.20 POST /apply/ 403 199 "https://waf.test/apply/" "$PH"
+$C; s=$(slack)
+has "D1: the 403 alert" "$s" "*HTTP 403 Forbidden*: 61 in"
+has "D1: ... lists the refused form POST" "$s" "Refused form POSTs: \`waf.test\` (1)"
+lacks "D1: ... and no separate form alert" "$s" "Form POSTs refused (403) on"
+: > /tmp/slack.log; $C; $C; : > /tmp/slack.log
 echo "-- what it did before still works"
 for i in $(seq 63); do v err.test 192.0.2.$(( i % 7 + 1 )) GET /programs/ 502 157 "-" "$PH"; done
 $C; s=$(slack)
@@ -68,11 +77,17 @@ has "R1: ... 7 clients, 5 listed: and N other" "$s" "and 2 other clients"
 out=$($D/bin/check-server-errors.sh --env $D/.env --dry-run)
 has "R2: dry run shows the 403 counts" "$out" "403s: 0 refused form POST(s)"
 has "R3: the run log has the 403 counts" "$(tail -3 $D/logs/server-error-monitor.log)" "403: form="
-echo "-- FORM_403_CHECK=false, SPIKE_403_THRESHOLD=0: both off"
-echo -e "FORM_403_CHECK=false\nSPIKE_403_THRESHOLD=0" >> $D/.env; : > /tmp/slack.log; $C; $C; $C; : > /tmp/slack.log
+echo "-- FORM_403_CHECK=false: no single-form alert"
+echo "FORM_403_CHECK=false" >> $D/.env; : > /tmp/slack.log; $C; $C; $C; : > /tmp/slack.log
 v off.test 203.0.113.9 POST /wp-admin/admin-ajax.php 403 162 "https://off.test/apply/" "$PH"
-for i in $(seq 60); do v off.test 192.0.2.$(( i % 5 + 1 )) GET /programs/ 403 199 "-" "$PH"; done
-$C; lacks "O1: both checks off: no 403 alerts" "$(slack)" "off.test"
+$C; lacks "O1: refused form POST: no alert" "$(slack)" "off.test"
+echo "-- 403 not in ERROR_CODES: no 403 alerts at all"
+sed -i '/^FORM_403_CHECK=/d' $D/.env; echo "ERROR_CODES=500,502,503,504" >> $D/.env; : > /tmp/slack.log
+v off2.test 203.0.113.9 POST /wp-admin/admin-ajax.php 403 162 "https://off2.test/apply/" "$PH"
+for i in $(seq 60); do v off2.test 192.0.2.$(( i % 5 + 1 )) GET /programs/ 403 199 "-" "$PH"; done
+$C; s=$(slack)
+lacks "O2: refused form POST: no alert" "$s" "off2.test"
+lacks "O2: 60 page 403s from 5 clients: no alert" "$s" "HTTP 403"
 
 echo "-- setup.sh --non-interactive"
 N=/opt/sem2; mkdir -p $N; cp -r /src/. $N/; rm -rf $N/.git $N/.env $N/state $N/logs
@@ -83,7 +98,7 @@ has "N1: no webhook in the environment: stops and says so" "$out" "set SLACK_WEB
 out=$(SLACK_WEBHOOK_URL=http://127.0.0.1:8099/hook bash $N/setup.sh --non-interactive < /dev/null 2>&1); rc=$?
 [[ $rc == 0 ]] && ok "N2: runs with no terminal and no answers (exit 0)" || bad "N2: rc=$rc: $(tail -3 <<<"$out")"
 has "N2: access logs auto-detected" "$(cat $N/.env)" 'ACCESS_LOGS="/var/log/nginx/*access*log"'
-has "N2: 403 checks on" "$(cat $N/.env)" "FORM_403_CHECK=true"
+has "N2: 403 in the default codes" "$(cat $N/.env)" "ERROR_CODES=403,500,502,503,504"
 has "N2: cron installed" "$(crontab -l)" "$N/bin/check-server-errors.sh --env $N/.env"
 lacks "N2: the webhook is never printed" "$out" "8099/hook"
 [[ ! -s /tmp/slack.log ]] && ok "N2: no Slack test message" || bad "N2: a test message was sent"
@@ -91,6 +106,14 @@ lacks "N2: the webhook is never printed" "$out" "8099/hook"
 out=$(SLACK_WEBHOOK_URL=http://127.0.0.1:8099/other bash $N/setup.sh --non-interactive < /dev/null 2>&1)
 has "N3: an existing .env is kept" "$out" "Keeping existing .env"
 lacks "N3: ... unchanged" "$(cat $N/.env)" "8099/other"
+sed -i 's/^ERROR_CODES=.*/ERROR_CODES=500,502,503,504/' $N/.env
+out=$(bash $N/setup.sh --non-interactive < /dev/null 2>&1)
+has "N5: an .env from before 403 monitoring: 403 added" "$(cat $N/.env)" "ERROR_CODES=403,500,502,503,504"
+has "N5: ... and says so" "$out" "Added 403 to ERROR_CODES"
+[[ $(stat -c %a $N/.env) == 600 ]] && ok "N5: ... still mode 600" || bad "N5: .env mode $(stat -c %a $N/.env)"
+sed -i 's/^ERROR_CODES=.*/ERROR_CODES=5xx,404/' $N/.env
+out=$(bash $N/setup.sh --non-interactive < /dev/null 2>&1)
+has "N6: a list someone changed is left alone" "$(cat $N/.env)" "ERROR_CODES=5xx,404"
 M=/opt/sem3; mkdir -p $M; cp -r /src/. $M/; rm -rf $M/.git $M/.env $M/state $M/logs; mv /var/log/nginx /var/log/nginx.off
 out=$(SLACK_WEBHOOK_URL=http://127.0.0.1:8099/hook bash $M/setup.sh --non-interactive < /dev/null 2>&1); rc=$?
 has "N4: no web logs, no containers (a database box): skipped" "$out" "Nothing to monitor here"

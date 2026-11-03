@@ -3,13 +3,12 @@
 Server-level watchdog that posts to Slack when:
 
 - **HTTP errors spike.** Any single monitored status code (default
-  `500,502,503,504`) shows up **more than 50 times** in the web server access
-  logs since the previous run.
+  `403,500,502,503,504`) shows up **more than 50 times** in the web server
+  access logs since the previous run. A 403 only counts when a visitor was
+  refused, from at least 3 clients: scanner paths (`/.env`, `/wp-login.php`,
+  ...) never count (see [403s](#403s)).
 - **A form POST is refused (403).** Any one: a visitor could not send the
-  form. Per site. Bots and scanners don't count (see [403 checks](#403-checks)).
-- **403s spike.** More than **50** 403s on paths visitors ask for, from at
-  least 3 clients, since the previous run: a firewall or block rule is
-  turning people away. Scanner paths (`/.env`, `/wp-login.php`, ...) never count.
+  form. Per site. Bots and scanners don't count.
 - **php-fpm is crashing.** The kernel log shows **3 or more** php-fpm
   segfaults / general protection faults (combined) since the previous run.
 
@@ -144,9 +143,10 @@ reboot are not counted after it.
 
 A lock (`flock`) stops a slow run from overlapping the next cron tick.
 
-## 403 checks
+## 403s
 
-Every 403 in the watched logs is looked at, whatever `ERROR_CODES` says:
+403 is in the default `ERROR_CODES`, but unlike the other codes only 403s that
+refused a visitor are counted. Each one is sorted:
 
 - **Refused form POST**: a `POST` from a browser (`Mozilla/` agent, not one
   that names itself a bot: `compatible;`, a `+http` link, `headless`) that
@@ -157,16 +157,25 @@ Every 403 in the watched logs is looked at, whatever `ERROR_CODES` says:
   on 10/29, across 13 servers, every real refused form POST had one and no bot
   did. WordPress answering `admin-ajax.php` with its 2-byte `-1`/`0` (a stale
   nonce on a cached page) is not a block and is left out.
-- **403 spike**: all other 403s on paths a visitor could ask for. Scanner paths
-  never count: dot files (`/.env`, `/.git/`), `.php` files other than
-  `index.php`, `wp-login.php`, `xmlrpc.php`, `/wp-admin/`, backups and
-  archives, and POSTs with no Referer. Alerts on more than
-  `SPIKE_403_THRESHOLD` (50) from at least `SPIKE_403_MIN_CLIENTS` (3)
-  different clients in a run, so one bot hammering a page doesn't.
+- **Visitor refused**: any other 403 on a path a visitor could ask for.
+- **Not counted at all**: scanner paths, where bots get refused all day: dot
+  files (`/.env`, `/.git/`), `.php` files other than `index.php`,
+  `wp-login.php`, `xmlrpc.php`, `/wp-admin/`, backups and archives, and POSTs
+  with no Referer.
 
-`FORM_403_CHECK=false` turns the form check off; `SPIKE_403_THRESHOLD=0`
-the spike. With Docker, watch the proxy (below): it is the one that logs the
-403s its sites answer.
+The counted 403s (form POSTs and visitors) alert like any other code, above
+`THRESHOLD_403` (default `ERROR_THRESHOLD`, 50), but only when they come from
+at least `MIN_CLIENTS_403` (3) different clients, so one bot hammering a page
+doesn't. While that alert is firing, any refused form POSTs are listed in it
+instead of alerting separately, so one block is never reported twice.
+
+To stop monitoring 403s, refused form POSTs included, remove `403` from
+`ERROR_CODES`. `FORM_403_CHECK=false` keeps the count but drops the
+single-form alert. Servers installed before 403 monitoring have
+`ERROR_CODES=500,502,503,504` in their `.env`; re-running the installer (or
+`fleet-install.sh`) adds 403 to exactly that list and leaves any other list
+alone. With Docker, watch the proxy (below): it is the one that logs the 403s
+its sites answer.
 
 ## Docker
 
@@ -244,7 +253,7 @@ tail /opt/server-error-monitor/logs/server-error-monitor.log
 position yet, it reads the last 5 MB of the file (the current boot for the
 journal), which is handy for checking the log format parses.
 
-Automated: `test/run.sh` runs the checks (403 form POSTs, 403 spikes, the
+Automated: `test/run.sh` runs the checks (403 form POSTs, visitor 403s, the
 existing HTTP error alert, cooldown/recovery, `setup.sh --non-interactive`)
 against crafted log lines in a throwaway Debian container with a fake Slack.
 

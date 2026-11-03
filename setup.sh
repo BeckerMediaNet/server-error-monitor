@@ -17,7 +17,7 @@ NONINTERACTIVE=false
 [[ "${1:-}" == --non-interactive ]] && NONINTERACTIVE=true
 declare -A PRESET=()
 for v in SITE_LABEL SLACK_WEBHOOK_URL DOCKER_CONTAINERS ACCESS_LOGS ERROR_CODES ERROR_THRESHOLD THRESHOLD_OVERRIDES \
-         KERNEL_ANSWER KERNEL_FAULT_THRESHOLD FORM403_ANSWER SPIKE_403_THRESHOLD ALERT_COOLDOWN_MINUTES OVERWRITE DO_TEST \
+         KERNEL_ANSWER KERNEL_FAULT_THRESHOLD ALERT_COOLDOWN_MINUTES OVERWRITE DO_TEST \
          DO_CRON; do
   [[ -n "${!v+x}" ]] && PRESET[$v]="${!v}"
 done
@@ -140,6 +140,13 @@ if [[ -f "$ENV_FILE" ]]; then
   if [[ ! "$OVERWRITE" =~ ^[Yy] ]]; then
     echo "Keeping existing .env. Re-run with that answer set to 'y' to redo it."
     SKIP_ENV=true
+    # Installs before 403 monitoring wrote the old default code list; bring
+    # those up to the new default. A list someone changed is left alone.
+    if grep -Eq '^ERROR_CODES="?500,502,503,504"?$' "$ENV_FILE"; then
+      sed -i -E 's/^ERROR_CODES="?500,502,503,504"?$/ERROR_CODES=403,500,502,503,504/' "$ENV_FILE"
+      echo "Added 403 to ERROR_CODES in .env: visitors refused by a firewall or security plugin,"
+      echo "and refused form POSTs, are now monitored. Remove 403 there to turn that off."
+    fi
   fi
 fi
 
@@ -246,8 +253,10 @@ if [[ "${SKIP_ENV:-false}" != true ]]; then
   # --- HTTP error codes ---
   echo
   echo "Which HTTP status codes should be monitored? Comma-separated exact codes"
-  echo "and/or whole classes, e.g. '500,502,503,504' or '5xx,404,429'."
-  ask ERROR_CODES "Error codes [500,502,503,504]: " "500,502,503,504"
+  echo "and/or whole classes, e.g. '403,500,502,503,504' or '5xx,404,429'. A 403 only"
+  echo "counts when a visitor was refused (scanner probes like /.env or /wp-login.php"
+  echo "never do), and a single refused form POST alerts on its own."
+  ask ERROR_CODES "Error codes [403,500,502,503,504]: " "403,500,502,503,504"
   ERROR_CODES="$(tr -d '[:space:]' <<< "$ERROR_CODES")"
 
   ask_number ERROR_THRESHOLD "Alert when a single code is seen MORE than this many times in one 5-minute run [50]: " "50"
@@ -284,20 +293,6 @@ if [[ "${SKIP_ENV:-false}" != true ]]; then
     ask_number KERNEL_FAULT_THRESHOLD "Alert when there are at least this many php-fpm faults since the last run [3]: " "3"
   fi
 
-  # --- 403 checks ---
-  echo
-  echo "403 checks: a form POST refused with a 403 (a visitor couldn't send the form)"
-  echo "alerts on the first one, per site; a spike of 403s on pages visitors ask for"
-  echo "alerts too (scanner paths like /.env or /wp-login.php never count)."
-  ask FORM403_ANSWER "Alert on refused form POSTs and 403 spikes? [Y/n]: " "Y"
-  if [[ "$FORM403_ANSWER" =~ ^[Nn] ]]; then
-    FORM_403_CHECK=false
-    SPIKE_403_THRESHOLD=0
-  else
-    FORM_403_CHECK=true
-    ask_number SPIKE_403_THRESHOLD "Alert on a 403 spike of MORE than this many refused visitor requests in one run [50]: " "50"
-  fi
-
   echo
   ask_number ALERT_COOLDOWN_MINUTES "Minutes before repeating an alert for a problem that's still ongoing [60]: " "60"
 
@@ -312,9 +307,6 @@ ${THRESHOLD_LINES}CHECK_KERNEL=${CHECK_KERNEL}
 KERNEL_LOG_SOURCE=auto
 KERNEL_FAULT_THRESHOLD=${KERNEL_FAULT_THRESHOLD}
 KERNEL_FAULT_PROCESS=php-fpm
-FORM_403_CHECK=${FORM_403_CHECK}
-SPIKE_403_THRESHOLD=${SPIKE_403_THRESHOLD}
-SPIKE_403_MIN_CLIENTS=3
 ALERT_COOLDOWN_MINUTES=${ALERT_COOLDOWN_MINUTES}
 RECOVERY_RUNS=2
 TOP_N=5
