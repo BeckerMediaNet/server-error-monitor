@@ -37,7 +37,8 @@ That command:
 1. Clones this repo into `/opt/server-error-monitor` (or pulls the latest if
    it's already there).
 2. Hands off to `setup.sh`, which asks for:
-   - a server label for Slack messages and the Slack webhook URL
+   - the site URL for Slack messages (defaults to the DigitalOcean droplet
+     name, else the hostname) and the Slack webhook URL
    - which **Docker containers** to watch, if Docker is running. It lists the
      running containers and suggests the reverse proxy (`nginx-proxy`,
      `traefik`) if there is one; see [Docker](#docker) below.
@@ -67,8 +68,8 @@ a machine that can SSH to them as root (or a user with passwordless sudo):
 ```
 
 Each server runs `install.sh --non-interactive`: access logs and containers
-are auto-detected, the label is the DigitalOcean droplet name (else the
-hostname), a server with no web access logs or containers is skipped, and a
+are auto-detected, the Slack label (`SITE_LABEL`) is the DigitalOcean droplet
+name (else the hostname) unless you pass `SITE_LABEL=...`, a server with no web access logs or containers is skipped, and a
 server that already has an `.env` keeps it and just gets the latest code. The
 webhook goes over ssh's stdin, never on a command line. For one server:
 `sudo SLACK_WEBHOOK_URL=... bash install-server-error-monitor.sh --non-interactive`
@@ -112,11 +113,11 @@ Example:
 ```
 🚨 aai.edu: server error alert
 
-503 Service Unavailable: 81 responses in the last 5 minutes (alerts above 50)
+HTTP 503 Service Unavailable: 81 in the last 5 minutes (threshold 50)
 The server turned these requests away: it was overloaded or in maintenance mode, or no site is set up for the address that was requested.
-• Sites affected: `64.23.213.183` (81, the server IP, not a site name). Requests to the bare server IP are almost always bots scanning the internet, not real visitors.
-• Most-requested URLs: `/wrangler.toml` (1), `/vultr.json` (1), `/vercel.json` (1), `/tencent.json` (1), `/service_account.json` (1) and 76 other URLs
-• Visitor IP addresses: `85.155.14.16` (81). 100% came from one IP, so this is most likely a single bot or scanner.
+• Top sites: `64.23.213.183` (81, the server IP, not a site name). Requests to the bare server IP are almost always bots scanning the internet, not real visitors.
+• Top paths: `/wrangler.toml` (1), `/vultr.json` (1), `/vercel.json` (1), `/tencent.json` (1), `/service_account.json` (1) and 76 other paths
+• Top clients: `85.155.14.16` (81). 100% came from one client, so this is most likely a single bot or scanner.
 ```
 
 **Kernel log**: it uses the systemd journal (`journalctl -k --since
@@ -203,7 +204,7 @@ set `DOCKER_CONTAINERS=nginx-proxy`. The proxy sees every request for
 every site, and it's the only place the 502/503s show up when a site's
 `httpd` or `php` container is down or unhealthy. Adding
 `aai_production_httpd` as well would count each request twice and halve
-the effective threshold. The alert's "Sites affected" line shows which site
+the effective threshold. The alert's "Top sites" line shows which site
 the errors are for.
 
 php-fpm crashes inside containers need nothing extra: containers share the
@@ -270,7 +271,7 @@ git push -u origin main
   easily produce 50+ 404s in 5 minutes. If you monitor `4xx` or `404`, give
   it its own higher threshold (`THRESHOLD_404=300`).
 - **One busy site can mask another**: the thresholds are per code across
-  all watched logs combined. The "Sites affected" / "Found in logs" lines in the alert
+  all watched logs combined. The "Top sites" / "Top logs" lines in the alert
   show where the errors came from.
 - The threshold is per run. If cron is stopped for an hour, the next run
   counts the whole hour's worth of new lines.

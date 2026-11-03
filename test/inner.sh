@@ -52,6 +52,7 @@ for i in $(seq 60); do v spike.test 192.0.2.$(( i % 5 + 1 )) GET /wp-login.php 4
 $C; s=$(slack)
 has "S1: 60 page 403s from 5 clients: spike alert, probes not counted" "$s" "HTTP 403 refusing visitors*: 60 in"
 has "S1: ... names the clients" "$s" "from 5 clients"
+has "S1: ... lists the paths" "$s" "Top paths: \`/programs/\` (60)"
 : > /tmp/slack.log; $C; $C; : > /tmp/slack.log
 for i in $(seq 60); do v onebot.test 192.0.2.9 GET /programs/ 403 199 "-" "$PH"; done
 $C; lacks "S2: 60 page 403s from one client: no spike" "$(slack)" "refusing visitors"
@@ -59,8 +60,11 @@ for i in $(seq 200); do v probes.test 192.0.2.$(( i % 9 + 1 )) GET /.git/config 
 $C; lacks "S3: 200 scanner-path 403s from 9 clients: no spike" "$(slack)" "refusing visitors"
 : > /tmp/slack.log
 echo "-- what it did before still works"
-for i in $(seq 60); do v err.test 192.0.2.$(( i % 5 + 1 )) GET /programs/ 502 157 "-" "$PH"; done
-$C; has "R1: 60 x 502: the existing HTTP error alert" "$(slack)" "*HTTP 502*: 60 in"
+for i in $(seq 63); do v err.test 192.0.2.$(( i % 7 + 1 )) GET /programs/ 502 157 "-" "$PH"; done
+$C; s=$(slack)
+has "R1: 63 x 502: the existing HTTP error alert" "$s" "*HTTP 502 Bad Gateway*: 63 in"
+has "R1: ... same list wording as the 403 alerts" "$s" "Top paths: \`/programs/\` (63)"
+has "R1: ... 7 clients, 5 listed: and N other" "$s" "and 2 other clients"
 out=$($D/bin/check-server-errors.sh --env $D/.env --dry-run)
 has "R2: dry run shows the 403 counts" "$out" "403s: 0 refused form POST(s)"
 has "R3: the run log has the 403 counts" "$(tail -3 $D/logs/server-error-monitor.log)" "403: form="

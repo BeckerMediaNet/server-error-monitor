@@ -408,13 +408,17 @@ threshold_for() {
   printf '%s' "${!var:-$ERROR_THRESHOLD}"
 }
 
-# top_list <code> <column> <noun> — "`value` (count), ... and N other <noun>s"
-# for the busiest values. A bare IPv4 address in the site column is flagged,
-# since it means the request didn't name a site at all.
+# top_list <file> <kind regex> <column> <noun> [site] — "`value` (count), ...
+# and N other <noun>s" for the busiest values in one column of a match file
+# (MATCHES or FORM403), over the rows whose first column matches <kind regex>
+# and, if given, whose site (or log, when no site was recorded) is [site]. A
+# bare IPv4 address in the site column is flagged, since it means the request
+# didn't name a site at all.
 top_list() {
-  awk -F'\t' -v c="$1" -v col="$2" '$1 == c && $col != "" { print $col }' "$MATCHES" \
+  awk -F'\t' -v k="$2" -v col="$3" -v s="${5:-}" \
+    '$1 ~ k && (s == "" || ($5 != "" ? $5 : $4) == s) && $col != "" { print $col }' "$1" \
     | sort | uniq -c | sort -rn \
-    | awk -v top="$TOP_N" -v noun="$3" -v site_col="$([[ $2 == 5 ]] && echo 1 || echo 0)" '
+    | awk -v top="$TOP_N" -v noun="$4" -v site_col="$([[ $3 == 5 ]] && echo 1 || echo 0)" '
         NR <= top {
           n = $1; $1 = ""; sub(/^ /, "")
           note = (site_col && $0 ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/) ? ", the server IP, not a site name" : ""
@@ -561,26 +565,26 @@ for code in $(printf '%s\n' ${CODES_TO_EVALUATE[@]+"${CODES_TO_EVALUATE[@]}"} | 
   alert_text=""
   if (( count > threshold )); then
     triggered=true
-    alert_text="*${label}*: ${count} responses in ${WINDOW_LABEL} (alerts above ${threshold})"
+    alert_text="*HTTP ${label}*: ${count} in ${WINDOW_LABEL} (threshold ${threshold})"
     meaning="$(code_meaning "$code")"
     [[ -n "$meaning" ]] && alert_text+=$'\n'"_${meaning}_"
-    sites="$(top_list "$code" 5 site)"
+    sites="$(top_list "$MATCHES" "^${code}\$" 5 site)"
     if [[ -n "$sites" ]]; then
-      alert_text+=$'\n'"• Sites affected: ${sites}"
+      alert_text+=$'\n'"• Top sites: ${sites}"
       [[ "$sites" == *"the server IP, not a site name"* ]] && \
         alert_text+=". Requests to the bare server IP are almost always bots scanning the internet, not real visitors."
     fi
-    alert_text+=$'\n'"• Most-requested URLs: $(top_list "$code" 3 URL)"
-    alert_text+=$'\n'"• Visitor IP addresses: $(top_list "$code" 2 IP)"
+    alert_text+=$'\n'"• Top paths: $(top_list "$MATCHES" "^${code}\$" 3 path)"
+    alert_text+=$'\n'"• Top clients: $(top_list "$MATCHES" "^${code}\$" 2 client)"
     share="$(top_share "$code" 2)"
     (( count >= 20 && share >= 80 )) && \
-      alert_text+=". ${share}% came from one IP, so this is most likely a single bot or scanner."
+      alert_text+=". ${share}% came from one client, so this is most likely a single bot or scanner."
     if (( SOURCE_COUNT > 1 )); then
-      alert_text+=$'\n'"• Found in logs: $(top_list "$code" 4 log)"
+      alert_text+=$'\n'"• Top logs: $(top_list "$MATCHES" "^${code}\$" 4 log)"
     fi
   fi
   evaluate "http_${code}" "$triggered" "$alert_text" \
-    "${label} responses are back under the alert level (${count} in ${WINDOW_LABEL}, alerts above ${threshold})"
+    "HTTP ${label} is back under threshold (${count} in ${WINDOW_LABEL}, threshold ${threshold})"
 done
 
 # --- 403 checks -------------------------------------------------------------
@@ -588,13 +592,6 @@ done
 # single one alerts, per site (same cooldown and recovery as everything else).
 # A spike of 403s on paths visitors ask for (scanner paths never count) from
 # several clients means a firewall or block rule is turning people away.
-# top_403 <kind regex> <column> [site] — like top_list, over the 403 file.
-top_403() {
-  awk -F'\t' -v k="$1" -v col="$2" -v s="${3:-}" \
-    '$1 ~ k && (s == "" || ($5 != "" ? $5 : $4) == s) && $col != "" { print $col }' "$FORM403" \
-    | sort | uniq -c | sort -rn | head -n "$TOP_N" \
-    | awk '{ n = $1; $1 = ""; sub(/^ /, ""); printf "%s`%s` (%d)", (NR > 1 ? ", " : ""), $0, n }'
-}
 FORM403_COUNT=$(awk -F'\t' '$1 == "form"' "$FORM403" | wc -l)
 REFUSED_COUNT=$(awk -F'\t' '$1 == "form" || $1 == "visit"' "$FORM403" | wc -l)
 REFUSED_CLIENTS=$(awk -F'\t' '$1 == "form" || $1 == "visit" { print $2 }' "$FORM403" | sort -u | wc -l)
@@ -614,7 +611,8 @@ if [[ "$FORM_403_CHECK" == true ]] && (( SOURCE_COUNT > 0 )); then
     if (( count > 0 )); then
       triggered=true
       alert_text="*Form POSTs refused (403) on ${s}*: ${count} in ${WINDOW_LABEL}, visitors cannot submit the form"
-      alert_text+=$'\n'"• Top paths: $(top_403 '^form$' 3 "$s")"$'\n'"• Top clients: $(top_403 '^form$' 2 "$s")"
+      alert_text+=$'\n'"• Top paths: $(top_list "$FORM403" '^form$' 3 path "$s")"
+      alert_text+=$'\n'"• Top clients: $(top_list "$FORM403" '^form$' 2 client "$s")"
       write_state "$STATE_DIR/alert_${key}.site" "$s"
     fi
     evaluate "$key" "$triggered" "$alert_text" "Form POSTs on ${s} are no longer refused (none in ${WINDOW_LABEL})"
@@ -627,9 +625,10 @@ if (( SPIKE_403_THRESHOLD > 0 && SOURCE_COUNT > 0 )); then
   if (( REFUSED_COUNT > SPIKE_403_THRESHOLD && REFUSED_CLIENTS >= SPIKE_403_MIN_CLIENTS )); then
     triggered=true
     alert_text="*HTTP 403 refusing visitors*: ${REFUSED_COUNT} in ${WINDOW_LABEL} from ${REFUSED_CLIENTS} clients (threshold ${SPIKE_403_THRESHOLD}; scanner paths not counted)"
-    sites="$(top_403 '^(form|visit)$' 5)"
+    sites="$(top_list "$FORM403" '^(form|visit)$' 5 site)"
     [[ -n "$sites" ]] && alert_text+=$'\n'"• Top sites: ${sites}"
-    alert_text+=$'\n'"• Top paths: $(top_403 '^(form|visit)$' 3)"$'\n'"• Top clients: $(top_403 '^(form|visit)$' 2)"
+    alert_text+=$'\n'"• Top paths: $(top_list "$FORM403" '^(form|visit)$' 3 path)"
+    alert_text+=$'\n'"• Top clients: $(top_list "$FORM403" '^(form|visit)$' 2 client)"
   fi
   evaluate "spike403_visitors" "$triggered" "$alert_text" \
     "403s refusing visitors are back under threshold (${REFUSED_COUNT} in ${WINDOW_LABEL}, threshold ${SPIKE_403_THRESHOLD})"
@@ -640,14 +639,14 @@ if [[ "$CHECK_KERNEL" == true && -n "$KERNEL_SOURCE_USED" ]]; then
   alert_text=""
   if (( KERNEL_FAULTS >= KERNEL_FAULT_THRESHOLD )); then
     triggered=true
-    alert_text="*\`${KERNEL_FAULT_PROCESS}\` process crashes*: ${KERNEL_FAULTS} in ${WINDOW_LABEL} (alerts at ${KERNEL_FAULT_THRESHOLD} or more): ${SEGFAULTS} segmentation fault(s), ${GPFS} general protection fault(s)"
+    alert_text="*\`${KERNEL_FAULT_PROCESS}\` process crashes*: ${KERNEL_FAULTS} in ${WINDOW_LABEL} (threshold ${KERNEL_FAULT_THRESHOLD}): ${SEGFAULTS} segmentation fault(s), ${GPFS} general protection fault(s)"
     if [[ "$KERNEL_FAULT_PROCESS" == php* ]]; then
       alert_text+=$'\n'"_The PHP processes that run the site's code are crashing, usually because of a buggy PHP extension or a memory problem. Visitors may see 502 errors or blank pages._"
     fi
     alert_text+=$'\n'"Kernel log excerpt:"$'\n'"\`\`\`$(head -n 3 "$KERNEL_LINES" | cut -c1-220)\`\`\`"
   fi
   evaluate "kernel_faults" "$triggered" "$alert_text" \
-    "\`${KERNEL_FAULT_PROCESS}\` crashes are back under the alert level (${KERNEL_FAULTS} in ${WINDOW_LABEL})"
+    "\`${KERNEL_FAULT_PROCESS}\` crashes are back under threshold (${KERNEL_FAULTS} in ${WINDOW_LABEL}, threshold ${KERNEL_FAULT_THRESHOLD})"
 fi
 
 # A monitor watching nothing should say so rather than stay silently green.
