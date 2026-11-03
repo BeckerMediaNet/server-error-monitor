@@ -162,7 +162,9 @@ Every 403 in the watched logs is looked at, whatever `ERROR_CODES` says:
   `index.php`, `wp-login.php`, `xmlrpc.php`, `/wp-admin/`, backups and
   archives, and POSTs with no Referer. Alerts on more than
   `SPIKE_403_THRESHOLD` (50) from at least `SPIKE_403_MIN_CLIENTS` (3)
-  different clients in a run, so one bot hammering a page doesn't.
+  different visitors in a run, so one bot hammering a page doesn't. A visitor
+  is an IP address; behind a load balancer, where the log shows the balancer's
+  private address for everyone, it is that address plus the browser.
 
 `FORM_403_CHECK=false` turns the form check off; `SPIKE_403_THRESHOLD=0`
 the spike. With Docker, watch the proxy (below): it is the one that logs the

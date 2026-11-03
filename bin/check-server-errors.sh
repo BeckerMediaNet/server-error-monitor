@@ -239,9 +239,15 @@ read_new() {
 #   visit  any other 403 on a path a visitor could ask for: counts toward the 403
 #          spike. Scanner paths (dot files, .php other than index.php, wp-login,
 #          xmlrpc, wp-admin, backups) never count: bots get refused there all day.
+# Each row also names the visitor: the client address, or when that address is
+# private (a load balancer in front logs everyone as itself) the address plus
+# the browser, since that's the only thing left to tell visitors apart.
 AWK_PARSE='
 function is_ip(s) {
   return s ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/ || s ~ /^[0-9a-fA-F]*:[0-9a-fA-F]*:[0-9a-fA-F:.]*$/
+}
+function private(a) {
+  return a ~ /^(10\.|127\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[01])\.)/ || tolower(a) ~ /^f[cd][0-9a-f]*:/
 }
 function kind403(method, url, after, ua, ref,   lp, qs, j, bytes, endpoint, page, browser) {
   lp = tolower(url); qs = ""
@@ -305,7 +311,7 @@ NF == 0 { next }
       rest = substr(rest, RSTART + RLENGTH)
     }
     k = kind403(parts[1], url, after, ua, ref)
-    if (k != "") print k "\t" client "\t" path "\t" src "\t" site >> f403
+    if (k != "") print k "\t" client "\t" path "\t" src "\t" site "\t" (private(client) ? client " " ua : client) >> f403
   }
   if (watched) print code "\t" client "\t" path "\t" src "\t" site
 }
@@ -597,7 +603,7 @@ top_403() {
 }
 FORM403_COUNT=$(awk -F'\t' '$1 == "form"' "$FORM403" | wc -l)
 REFUSED_COUNT=$(awk -F'\t' '$1 == "form" || $1 == "visit"' "$FORM403" | wc -l)
-REFUSED_CLIENTS=$(awk -F'\t' '$1 == "form" || $1 == "visit" { print $2 }' "$FORM403" | sort -u | wc -l)
+REFUSED_CLIENTS=$(awk -F'\t' '$1 == "form" || $1 == "visit" { print $6 }' "$FORM403" | sort -u | wc -l)   # visitors, see AWK_PARSE
 if [[ "$FORM_403_CHECK" == true ]] && (( SOURCE_COUNT > 0 )); then
   FORM_SITES=()
   while IFS= read -r s; do
@@ -627,7 +633,7 @@ if (( SPIKE_403_THRESHOLD > 0 && SOURCE_COUNT > 0 )); then
   alert_text=""
   if (( REFUSED_COUNT > SPIKE_403_THRESHOLD && REFUSED_CLIENTS >= SPIKE_403_MIN_CLIENTS )); then
     triggered=true
-    alert_text="*403 Forbidden for visitors*: ${REFUSED_COUNT} responses in ${WINDOW_LABEL} from ${REFUSED_CLIENTS} IP addresses (alerts above ${SPIKE_403_THRESHOLD})"
+    alert_text="*403 Forbidden for visitors*: ${REFUSED_COUNT} responses in ${WINDOW_LABEL} from ${REFUSED_CLIENTS} different visitors (alerts above ${SPIKE_403_THRESHOLD})"
     alert_text+=$'\n'"_Visitors are being blocked from pages, usually by a firewall, a security plugin or an access rule. Paths only bots probe, like wp-login.php and .env, are not counted._"
     sites="$(top_403 '^(form|visit)$' 5)"
     [[ -n "$sites" ]] && alert_text+=$'\n'"• Sites affected: ${sites}"
@@ -683,7 +689,7 @@ if [[ "$DRY_RUN" == true ]]; then
     echo "  $src — $lines lines read, $unparsed without a recognisable status code"
   done < "$STATS"
   echo "Monitored codes (${ERROR_CODES}) seen:${SUMMARY:- none}"
-  echo "403s: ${FORM403_COUNT} refused form POST(s), ${REFUSED_COUNT} refused visitor request(s) from ${REFUSED_CLIENTS} client(s) (spike threshold ${SPIKE_403_THRESHOLD}, scanner paths not counted)"
+  echo "403s: ${FORM403_COUNT} refused form POST(s), ${REFUSED_COUNT} refused visitor request(s) from ${REFUSED_CLIENTS} visitor(s) (spike threshold ${SPIKE_403_THRESHOLD}, scanner paths not counted)"
   for code in $(printf '%s\n' ${CODE_COUNT[@]+"${!CODE_COUNT[@]}"} | sort); do
     threshold="$(threshold_for "$code")"
     (( CODE_COUNT[$code] > threshold )) && echo "  $code is OVER its threshold of $threshold"
