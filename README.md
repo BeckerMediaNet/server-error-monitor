@@ -166,7 +166,8 @@ refused a visitor are counted. Each one is sorted:
 The counted 403s (form POSTs and visitors) alert like any other code, above
 `THRESHOLD_403` (default `ERROR_THRESHOLD`, 50), but only when they come from
 at least `MIN_CLIENTS_403` (3) different clients, so one bot hammering a page
-doesn't. While that alert is firing, any refused form POSTs are listed in it
+doesn't. Behind a load balancer, which logs every visitor as its own private
+address, a client is that address plus the browser. While that alert is firing, any refused form POSTs are listed in it
 instead of alerting separately, so one block is never reported twice.
 
 To stop monitoring 403s, refused form POSTs included, remove `403` from

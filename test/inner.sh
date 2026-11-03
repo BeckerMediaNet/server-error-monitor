@@ -69,6 +69,20 @@ has "D1: the 403 alert" "$s" "*HTTP 403 Forbidden*: 61 in"
 has "D1: ... lists the refused form POST" "$s" "Refused form POSTs: \`waf.test\` (1)"
 lacks "D1: ... and no separate form alert" "$s" "Form POSTs refused (403) on"
 : > /tmp/slack.log; $C; $C; : > /tmp/slack.log
+for i in $(seq 120); do v rotate.test 192.0.2.20 GET /programs/ 403 199 "-" "Mozilla/5.0 (iPhone; CPU iPhone OS 18_$(( i % 40 )) like Mac OS X)"; done
+$C; lacks "S4: 120 page 403s from one public IP with 40 browsers: still one client, no alert" "$(slack)" "HTTP 403"
+: > /tmp/slack.log
+echo "-- behind a load balancer: every visitor is logged as the balancer's private address"
+v lbform.test 10.138.248.36 POST /wp-admin/admin-ajax.php 403 162 "https://lbform.test/apply/" "$PH"
+$C; has "LB1: a refused form POST through the balancer alerts" "$(slack)" "Form POSTs refused (403) on lbform.test"
+: > /tmp/slack.log; $C; $C; : > /tmp/slack.log
+for i in $(seq 120); do v lbbot.test 10.138.$(( i % 2 ? 132 : 248 )).$(( i % 2 ? 111 : 36 )) GET /programs/ 403 199 "-" "$PH"; done
+$C; lacks "LB2: 120 page 403s via 2 balancer addresses, one browser (one bot): no alert" "$(slack)" "HTTP 403"
+for i in $(seq 120); do v lbspike.test 10.138.$(( i % 2 ? 132 : 248 )).$(( i % 2 ? 111 : 36 )) GET /programs/ 403 199 "-" "Mozilla/5.0 (iPhone; CPU iPhone OS 18_$(( i % 40 )) like Mac OS X)"; done
+$C; s=$(slack)
+has "LB3: 120 page 403s via 2 balancer addresses, 40 browsers: the 403 alert" "$s" "*HTTP 403 Forbidden*: 120 in"
+has "LB3: ... counted by browser" "$s" "from 40 clients"
+: > /tmp/slack.log; $C; $C; : > /tmp/slack.log
 echo "-- what it did before still works"
 for i in $(seq 63); do v err.test 192.0.2.$(( i % 7 + 1 )) GET /programs/ 502 157 "-" "$PH"; done
 $C; s=$(slack)

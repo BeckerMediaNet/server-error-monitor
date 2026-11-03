@@ -136,7 +136,7 @@ fi
 
 TMP_DIR="$(mktemp -d)"
 trap 'rm -rf "$TMP_DIR"' EXIT
-MATCHES="$TMP_DIR/matches.tsv"   # code<TAB>client<TAB>path<TAB>source<TAB>site, one row per monitored error
+MATCHES="$TMP_DIR/matches.tsv"   # code<TAB>client<TAB>path<TAB>source<TAB>site[<TAB>visitor on 403s], one row per monitored error
 STATS="$TMP_DIR/stats"           # source<TAB>lines<TAB>unparsed, one row per log source
 FORM403="$TMP_DIR/403.tsv"       # form<TAB>client<TAB>path<TAB>source<TAB>site (or source), one row per refused form POST
 : > "$MATCHES"
@@ -240,7 +240,13 @@ read_new() {
 # Anything else is dropped: scanner paths (dot files, .php other than index.php,
 # wp-login, xmlrpc, wp-admin, backups) and POSTs with no Referer, since bots get
 # refused there all day.
+# A 403 row also names its visitor: the client address, or when that address is
+# private (a load balancer in front logs everyone as itself) the address plus
+# the browser, since that is all that is left to tell visitors apart.
 AWK_PARSE='
+function private(a) {
+  return a ~ /^(10\.|127\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[01])\.)/ || tolower(a) ~ /^f[cd][0-9a-f]*:/
+}
 function is_ip(s) {
   return s ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/ || s ~ /^[0-9a-fA-F]*:[0-9a-fA-F]*:[0-9a-fA-F:.]*$/
 }
@@ -309,7 +315,7 @@ NF == 0 { next }
     if (k == "") next
     if (k == "form" && f403 != "") print k "\t" client "\t" path "\t" src "\t" (site != "" ? site : src) >> f403
   }
-  print code "\t" client "\t" path "\t" src "\t" site
+  print code "\t" client "\t" path "\t" src "\t" site (code == "403" ? "\t" (private(client) ? client " " ua : client) : "")
 }
 END { print src "\t" (total + 0) "\t" (unparsed + 0) >> stats }
 '
@@ -556,8 +562,9 @@ for f in "$STATE_DIR"/alert_http_*; do
 done
 
 # 403s also need MIN_CLIENTS_403 different clients, so one bot hammering a
-# page doesn't alert.
-CLIENTS_403=$(awk -F'\t' '$1 == "403" { print $2 }' "$MATCHES" | sort -u | wc -l)
+# page doesn't alert. Behind a load balancer a client is its address plus the
+# browser (the visitor column, see AWK_PARSE).
+CLIENTS_403=$(awk -F'\t' '$1 == "403" { print $6 }' "$MATCHES" | sort -u | wc -l)
 FORM403_COUNT=$(wc -l < "$FORM403")
 HTTP403_OVER=false
 
