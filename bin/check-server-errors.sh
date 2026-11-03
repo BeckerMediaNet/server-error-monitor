@@ -628,6 +628,7 @@ if [[ "$FORM_403_CHECK" == true && "$HTTP403_OVER" != true ]] && (( SOURCE_COUNT
     if (( count > 0 )); then
       triggered=true
       alert_text="*Form POSTs refused (403) on ${s}*: ${count} in ${WINDOW_LABEL}, visitors cannot submit the form"
+      alert_text+=$'\n'"_Visitors sent a form on this site and were refused, so those submissions did not go through._"
       alert_text+=$'\n'"• Top paths: $(top_list "$FORM403" '^form$' 3 path "$s")"
       alert_text+=$'\n'"• Top clients: $(top_list "$FORM403" '^form$' 2 client "$s")"
       write_state "$STATE_DIR/alert_${key}.site" "$s"

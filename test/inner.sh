@@ -38,6 +38,7 @@ has "F3: Gravity Forms REST submission refused: alert" "$s" "Form POSTs refused 
 lacks "F4: bot POSTs (no Referer, xmlrpc, wp-login, self-named agent): no alert" "$s" "bots.test"
 lacks "F5: WordPress 2-byte reply (stale nonce): no alert" "$s" "nonce.test"
 has "F6: the alert says what it means" "$s" "visitors cannot submit the form"
+has "F6: ... and explains it" "$s" "those submissions did not go through"
 : > /tmp/slack.log
 echo "-- cooldown and recovery"
 v learn.test 203.0.113.5 POST /wp-admin/admin-ajax.php 403 162 "https://learn.test/apply/" "$PH"
