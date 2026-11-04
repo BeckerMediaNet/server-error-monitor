@@ -259,7 +259,7 @@ if [[ "${SKIP_ENV:-false}" != true ]]; then
   ask ERROR_CODES "Error codes [403,500,502,503,504]: " "403,500,502,503,504"
   ERROR_CODES="$(tr -d '[:space:]' <<< "$ERROR_CODES")"
 
-  ask_number ERROR_THRESHOLD "Alert when a single code is seen MORE than this many times in one 5-minute run [50]: " "50"
+  ask_number ERROR_THRESHOLD "Alert when real visitors (bots not counted) get a single code MORE than this many times in one 5-minute run [50]: " "50"
 
   echo
   echo "Optional: different thresholds for specific codes, e.g. '404=300,429=100'."
