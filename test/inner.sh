@@ -103,6 +103,10 @@ for i in $(seq 60); do v crawl.test 66.249.66.$(( i % 5 + 1 )) GET /programs/ 50
 $C; lacks "B6: 60 x 503 to Googlebot: no alert" "$(slack)" "HTTP 503"
 for i in $(seq 60); do v solo.test 203.0.113.50 GET /programs/ 500 157 "-" "$PH"; done
 $C; lacks "B7: 60 x 500 to one real visitor (MIN_REAL_CLIENTS=3): no alert" "$(slack)" "HTTP 500"
+for i in $(seq 60); do v ver.test 198.51.100.$(( i + 120 )) GET /readme.html 403 199 "-" "$DESK"; done
+$C; lacks "B8: 60 x 403 for readme.html, one per client (a version scan): no alert" "$(slack)" "HTTP 403"
+for c in 1 2 3 4 5; do for i in $(seq 12); do v fake.test 198.51.100.8$c GET /old-$i/ 500 157 "https://fake.test/" "$DESK"; done; done
+$C; lacks "B9: 60 x 500, each client working through 12 paths with a faked same-site Referer: no alert" "$(slack)" "HTTP 500"
 echo "-- bot filter: real visitors still alert, with the bots left out"
 for c in 1 2 3 4 5; do
   v real.test 203.0.113.6$c GET /apply/ 200 30000 "-" "$DESK"
@@ -134,7 +138,7 @@ has "E1: shows the bot filter summary" "$out" "Bot filter (BOT_FILTER=true)"
 has "E1: ... the bare-IP scanner, with its reason" "$out" "85.155.14.16"
 has "E1: ... and why" "$out" "bare-ip"
 has "E1: ... real visitors with their score" "$out" "score -5 (loads-assets,same-site-referer)"
-has "E1: ... the enumerating client" "$out" "score 4 (enumeration,all-failed)"
+has "E1: ... the enumerating client" "$out" "score 5 (enumeration,all-failed)"
 has "E1: ... the old browser" "$out" "score 3 (old-browser,all-failed)"
 has "E1: ... the client that asked for /.env" "$out" "score 4 (probed,all-failed)"
 has "E1: ... the outage's bots" "$out" "bot-agent"
