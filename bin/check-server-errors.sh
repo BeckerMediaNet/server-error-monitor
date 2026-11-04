@@ -273,7 +273,9 @@ read_new() {
 #   probe        a path no visitor asks for: dot files (/.env, /.git/),
 #                backups and config files (.sql, .zip, .yml, .toml, a .json
 #                at the web root), .php files other than WordPress's own entry
-#                points (xmlrpc.php included), /vendor/, /cgi-bin/, phpMyAdmin
+#                points (xmlrpc.php included), /vendor/, /cgi-bin/, phpMyAdmin,
+#                and the readme/license files scanners read WordPress and
+#                plugin versions from (readme.html, readme.txt, license.txt)
 #   no-agent     no User-Agent
 #   crawler      a search engine's crawler (Googlebot, Bingbot, ...)
 #   tool-agent   a script or scanner (curl, python, Go, zgrab, nuclei, ...)
@@ -315,6 +317,7 @@ function is_probe(lp) {
   if (lp ~ /\.php$/ && lp !~ /(^|\/)index\.php$/ && lp !~ /^\/wp-admin\// && lp !~ /^\/(wp-login|wp-cron|wp-comments-post|wp-signup|wp-activate|wp-trackback)\.php$/) return 1
   if (lp ~ /^\/(vendor|cgi-bin|phpmyadmin|pma|myadmin|adminer|actuator|solr|owa|ecp|autodiscover|boaform|hnap1|geoserver|druid|telescope|_ignition|server-status)(\/|$)/) return 1
   if (lp ~ /wlwmanifest\.xml$/) return 1
+  if (lp ~ /(^|\/)(readme\.html|readme\.txt|license\.txt|changelog\.txt)$/) return 1
   return 0
 }
 # agent_hard <user agent> — a hard bot reason for the agent alone, or "".
@@ -501,8 +504,9 @@ SOURCE_COUNT=$(( ${#LOG_FILES[@]} + ${#CONTAINERS[@]} ))
 # its request's soft points and adds what its client did across all the logs
 # since the last run:
 #   probed            +3  also asked for a probe path (/.env, /.git/, ...)
-#   enumeration       +3  errors on 8+ different paths, under 20% answered OK:
-#                         working through a list, not reading a site
+#   enumeration       +4  errors on 8+ different paths, under 20% answered OK:
+#                         working through a list, not reading a site. +4 so a
+#                         faked same-site Referer (-2) doesn't cancel it out
 #   all-failed        +1  not a single request answered OK
 #   loads-assets      -3  loaded 3+ css/js/font/image files: a browser
 #                         drawing the page (behind a CDN those never reach
@@ -519,7 +523,7 @@ function add(pts, label) { s += pts; lab = lab (lab != "" ? "," : "") label }
   c = $2; h = $6; s = $7 + 0; lab = ($8 == "-") ? "" : $8
   if (h == "-") {
     if (pr[c]) add(3, "probed")
-    if (ne[c] >= 8 && ok[c] * 5 < n[c]) add(3, "enumeration")
+    if (ne[c] >= 8 && ok[c] * 5 < n[c]) add(4, "enumeration")
     if (ok[c] == 0) add(1, "all-failed")
     if (as[c] >= 3) add(-3, "loads-assets")
     if (sr[c]) add(-2, "same-site-referer")

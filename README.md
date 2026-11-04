@@ -138,7 +138,7 @@ last run, errors and successes alike.
 | Reason | What it means |
 |---|---|
 | `bare-ip` | sent to the server's IP address, not a site name (needs the hostname in the log, see above) |
-| `probe` | a path no visitor asks for: dot files (`/.env`, `/.git/`), backups and config files (`.sql`, `.zip`, `.yml`, `.toml`, a `.json` at the web root), `.php` files other than WordPress's own (`xmlrpc.php` included), `/vendor/`, `/cgi-bin/`, phpMyAdmin |
+| `probe` | a path no visitor asks for: dot files (`/.env`, `/.git/`), backups and config files (`.sql`, `.zip`, `.yml`, `.toml`, a `.json` at the web root), `.php` files other than WordPress's own (`xmlrpc.php` included), `/vendor/`, `/cgi-bin/`, phpMyAdmin, and the files scanners read WordPress and plugin versions from (`readme.html`, `readme.txt`, `license.txt`) |
 | `bad-request` | no proper `METHOD /path HTTP/x` request line (TLS sent to port 80, `-`, an unknown method) |
 | `no-agent` | no User-Agent |
 | `tool-agent` | a script or scan tool: curl, wget, python, Go, Java, zgrab, nuclei, wpscan, headless browsers, ... |
@@ -150,7 +150,7 @@ last run, errors and successes alike.
 | Signal | Points | Why |
 |---|---|---|
 | `probed` | +3 | the same client also asked for a probe path |
-| `enumeration` | +3 | errors on 8+ different paths and under 20% of its requests answered OK: working through a list |
+| `enumeration` | +4 | errors on 8+ different paths and under 20% of its requests answered OK: working through a list. Enough that a faked same-site Referer doesn't cancel it out |
 | `not-a-browser` | +2 | the agent isn't a browser's `Mozilla/...` string |
 | `old-browser` | +2 | Chrome or Firefox older than 100, or Internet Explorer: bots copy old strings, browsers update themselves |
 | `head-request` | +2 | `HEAD`: browsers never send one |
