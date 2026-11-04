@@ -7,6 +7,10 @@
 # php-fpm segfaults / general protection faults, and posts a Slack alert via
 # an Incoming Webhook when either crosses its threshold.
 #
+# Only errors that real visitors got count toward a threshold: every error is
+# scored as bot or real traffic first (see "Bot filter" below), so scanners
+# hitting the bare server IP or probing for /.env don't alert.
+#
 # Only what's new since the previous run is counted (byte offsets for log
 # files, a timestamp for the systemd journal), so it's designed to run from
 # root's cron every 5 minutes. The very first run just records where the
@@ -16,6 +20,8 @@
 #   ./check-server-errors.sh                  # run the real check
 #   ./check-server-errors.sh --test-slack     # send a Slack test message and exit
 #   ./check-server-errors.sh --dry-run        # print counts only: no Slack, no state changes
+#   ./check-server-errors.sh --explain        # dry run over the last 5 MB of each log, showing
+#                                             # which errors were scored as bots and why
 #   ./check-server-errors.sh --env /path/.env # use a specific .env file
 #
 set -uo pipefail
@@ -25,6 +31,7 @@ ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 ENV_FILE="$ROOT_DIR/.env"
 TEST_SLACK=false
 DRY_RUN=false
+EXPLAIN=false
 
 # --- argument parsing -------------------------------------------------
 while [[ $# -gt 0 ]]; do
@@ -35,6 +42,11 @@ while [[ $# -gt 0 ]]; do
       ;;
     --dry-run)
       DRY_RUN=true
+      shift
+      ;;
+    --explain)
+      DRY_RUN=true
+      EXPLAIN=true
       shift
       ;;
     --env)
@@ -70,7 +82,12 @@ KERNEL_LOG_SOURCE="${KERNEL_LOG_SOURCE:-auto}"
 KERNEL_FAULT_THRESHOLD="${KERNEL_FAULT_THRESHOLD:-3}"
 KERNEL_FAULT_PROCESS="${KERNEL_FAULT_PROCESS:-php-fpm}"
 FORM_403_CHECK="${FORM_403_CHECK:-true}"
-MIN_CLIENTS_403="${MIN_CLIENTS_403:-3}"
+MIN_REAL_CLIENTS="${MIN_REAL_CLIENTS:-3}"
+BOT_FILTER="${BOT_FILTER:-true}"
+BOT_SCORE_THRESHOLD="${BOT_SCORE_THRESHOLD:-3}"
+OUTAGE_THRESHOLD="${OUTAGE_THRESHOLD:-100}"
+OUTAGE_MIN_CLIENTS="${OUTAGE_MIN_CLIENTS:-10}"
+EXPLAIN_TOP="${EXPLAIN_TOP:-25}"
 ALERT_COOLDOWN_MINUTES="${ALERT_COOLDOWN_MINUTES:-60}"
 RECOVERY_RUNS="${RECOVERY_RUNS:-2}"
 TOP_N="${TOP_N:-5}"
@@ -136,10 +153,16 @@ fi
 
 TMP_DIR="$(mktemp -d)"
 trap 'rm -rf "$TMP_DIR"' EXIT
-MATCHES="$TMP_DIR/matches.tsv"   # code<TAB>client<TAB>path<TAB>source<TAB>site, one row per monitored error
+RAW="$TMP_DIR/raw.tsv"           # one row per monitored error, as parsed (see AWK_PARSE)
+CSTATS="$TMP_DIR/clients.tsv"    # client<TAB>requests<TAB>ok<TAB>assets<TAB>error paths<TAB>same-site referer<TAB>probed, per log source
+ALL="$TMP_DIR/all.tsv"           # RAW scored: code client path source site class reason score signals method agent
+MATCHES="$TMP_DIR/matches.tsv"   # the rows of ALL that real visitors got (all of them with BOT_FILTER=false)
+BOTS="$TMP_DIR/bots.tsv"         # the rows of ALL scored as bots
+PAGES="$TMP_DIR/pages.tsv"       # the rows of ALL for a normal page on a named site, whoever asked (outage check)
 STATS="$TMP_DIR/stats"           # source<TAB>lines<TAB>unparsed, one row per log source
 FORM403="$TMP_DIR/403.tsv"       # form<TAB>client<TAB>path<TAB>source<TAB>site (or source), one row per refused form POST
-: > "$MATCHES"
+: > "$RAW"
+: > "$CSTATS"
 : > "$STATS"
 : > "$FORM403"
 
@@ -176,7 +199,8 @@ head_sum() {
 # if the file shrank or its first bytes changed (copytruncate, even when it
 # has already grown past the old position), it's read from the start. With no saved
 # position it only records one (first run) — except in a dry run, where it
-# prints the last 5 MB so you can see what the parser makes of it.
+# prints the last 5 MB so you can see what the parser makes of it. --explain
+# always reads the last 5 MB, so there's enough traffic to judge the scoring.
 read_new() {
   local file="$1" offset_file inode size old_inode="" old_offset="" old_head="" old_head_len=0 rotated head_len
   offset_file="$STATE_DIR/offset_$(state_key "$file")"
@@ -188,7 +212,7 @@ read_new() {
   read -r inode size < <(stat -c '%i %s' "$file" 2>/dev/null) || return 0
   [[ -f "$offset_file" ]] && read -r old_inode old_offset old_head old_head_len < "$offset_file"
 
-  if [[ -z "$old_offset" ]]; then
+  if [[ -z "$old_offset" || "$EXPLAIN" == true ]]; then
     if [[ "$DRY_RUN" == true ]]; then
       tail -c 5000000 "$file"
     else
@@ -237,9 +261,33 @@ read_new() {
 #          nonce on a cached page, not a block, and is left out. Also written to
 #          the form file (f403) for the refused-form alert.
 #   visit  any other 403 on a path a visitor could ask for.
-# Anything else is dropped: scanner paths (dot files, .php other than index.php,
-# wp-login, xmlrpc, wp-admin, backups) and POSTs with no Referer, since bots get
-# refused there all day.
+# Anything else is never counted ("probe-403"): scanner paths (dot files, .php
+# other than index.php, wp-login, xmlrpc, wp-admin, backups) and POSTs with no
+# Referer, since bots get refused there all day.
+#
+# Bot filter, part 1 (here, per request). Every error row gets either a hard
+# reason, which makes it a bot whatever else the client did:
+#   bad-request  no proper "METHOD /path HTTP/x" request line (TLS sent to
+#                port 80, "-", an unknown method)
+#   bare-ip      sent to the server's IP address, not to a site name
+#   probe        a path no visitor asks for: dot files (/.env, /.git/),
+#                backups and config files (.sql, .zip, .yml, .toml, a .json
+#                at the web root), .php files other than WordPress's own entry
+#                points (xmlrpc.php included), /vendor/, /cgi-bin/, phpMyAdmin
+#   no-agent     no User-Agent
+#   crawler      a search engine's crawler (Googlebot, Bingbot, ...)
+#   tool-agent   a script or scanner (curl, python, Go, zgrab, nuclei, ...)
+#   bot-agent    an agent that names itself a bot (bot/, crawl, spider, a URL)
+# or soft points that the client's behaviour adds to (part 2, SCORE_AWK):
+#   not-a-browser +2  an agent that isn't a browser's "Mozilla/..." string
+#   old-browser   +2  Chrome or Firefox older than version 100, or Internet
+#                     Explorer: bots copy old browser strings, browsers update
+#   head-request  +2  HEAD (browsers never send one)
+#   http1.0       +2  HTTP/1.0 (browsers never send one)
+# Every line (not just errors) also adds to its client's totals, written to
+# the cstats file at the end: requests, successful (2xx/3xx) replies, static
+# files loaded, distinct paths that errored, whether it sent a same-site
+# Referer, and whether it asked for a probe path.
 AWK_PARSE='
 function is_ip(s) {
   return s ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/ || s ~ /^[0-9a-fA-F]*:[0-9a-fA-F]*:[0-9a-fA-F:.]*$/
@@ -259,6 +307,33 @@ function kind403(method, url, after, ua, ref,   lp, qs, j, bytes, endpoint, page
   if (method == "POST" && !(browser && ref != "" && ref != "-")) return ""
   return "visit"
 }
+# is_probe <lowercased path, no query string> — a path only scanners ask for.
+function is_probe(lp) {
+  if (lp ~ /\/\./) return 1
+  if (lp ~ /\.(bak|old|orig|save|swp|sql|zip|tar|gz|tgz|rar|7z|env|ini|log|yml|yaml|toml|conf|config|cfg|pem|key|asp|aspx|jsp|cgi|cfm)$/) return 1
+  if (lp ~ /^\/[^\/]+\.json$/ && lp != "/manifest.json") return 1
+  if (lp ~ /\.php$/ && lp !~ /(^|\/)index\.php$/ && lp !~ /^\/wp-admin\// && lp !~ /^\/(wp-login|wp-cron|wp-comments-post|wp-signup|wp-activate|wp-trackback)\.php$/) return 1
+  if (lp ~ /^\/(vendor|cgi-bin|phpmyadmin|pma|myadmin|adminer|actuator|solr|owa|ecp|autodiscover|boaform|hnap1|geoserver|druid|telescope|_ignition|server-status)(\/|$)/) return 1
+  if (lp ~ /wlwmanifest\.xml$/) return 1
+  return 0
+}
+# agent_hard <user agent> — a hard bot reason for the agent alone, or "".
+function agent_hard(ua,   l) {
+  if (ua == "" || ua == "-") return "no-agent"
+  l = tolower(ua)
+  if (l ~ /googlebot|google-inspectiontool|bingbot|bingpreview|duckduckbot|yandex(bot|images)|baiduspider|applebot|slurp|petalbot|seznambot/) return "crawler"
+  if (l ~ /^(curl|wget|python|go-http-client|java|okhttp|libwww|lwp|perl|ruby|php|guzzle|axios|node|undici|apache-httpclient|scrapy|aiohttp|httpx|fasthttp|colly|postman|httpie|reqwest|dart|winhttp|mechanize|faraday|wordpress)/) return "tool-agent"
+  if (l ~ /zgrab|masscan|nmap|nikto|sqlmap|nuclei|wpscan|censys|shodan|l9scan|leakix|expanse|phantomjs|selenium|puppeteer|playwright|headless/) return "tool-agent"
+  if (l ~ /bot[\/;+)]|bot$|crawl|spider|scan|compatible[;)]|https?:\/\/|\+http/) return "bot-agent"
+  return ""
+}
+# major <ua> <name/> — the major version after e.g. "Chrome/", or -1.
+function major(ua, name,   p, v) {
+  p = index(ua, name); if (p == 0) return -1
+  v = substr(ua, p + length(name)); sub(/[^0-9].*/, "", v)
+  return (v == "") ? -1 : v + 0
+}
+function soft(pts, label) { spts += pts; slab = slab (slab != "" ? "," : "") label }
 BEGIN {
   n = split(codes, list, ",")
   for (i = 1; i <= n; i++) {
@@ -276,15 +351,14 @@ NF == 0 { next }
   total++
   if (!match($0, /" [1-5][0-9][0-9] /)) { unparsed++; next }
   code = substr($0, RSTART + 2, 3)
-  watched = (code in exact) || (substr(code, 1, 1) in cls)
-  if (!watched) next
   after = substr($0, RSTART + RLENGTH)
   q = index($0, "\"")
   req = substr($0, q + 1, RSTART - q - 1)
-  split(req, parts, " ")
+  np = split(req, parts, " ")
   url = (parts[2] != "") ? parts[2] : req
   path = url
   sub(/\?.*/, "", path)
+  lp = tolower(path)
   if (length(path) > 100) path = substr(path, 1, 100) "..."
   client = $1; site = ""; ci = 0
   for (j = 1; j <= NF && substr($j, 1, 1) != "["; j++) ;
@@ -297,21 +371,54 @@ NF == 0 { next }
       if (s !~ /[|]/ && s ~ /\./ && (s ~ /[A-Za-z]/ || is_ip(s))) site = s
     }
   }
-  if (code == "403") {
-    ref = ""; ua = ""; rest = after; nq = 0
-    while (match(rest, /"[^"]*"/)) {
-      nq++
-      if (nq == 1) ref = substr(rest, RSTART + 1, RLENGTH - 2)
-      else { ua = substr(rest, RSTART + 1, RLENGTH - 2); break }
-      rest = substr(rest, RSTART + RLENGTH)
-    }
-    k = kind403(parts[1], url, after, ua, ref)
-    if (k == "") next
-    if (k == "form" && f403 != "") print k "\t" client "\t" path "\t" src "\t" (site != "" ? site : src) >> f403
+  ref = ""; ua = ""; rest = after; nq = 0
+  while (match(rest, /"[^"]*"/)) {
+    nq++
+    if (nq == 1) ref = substr(rest, RSTART + 1, RLENGTH - 2)
+    else { ua = substr(rest, RSTART + 1, RLENGTH - 2); break }
+    rest = substr(rest, RSTART + RLENGTH)
   }
-  print code "\t" client "\t" path "\t" src "\t" site
+
+  # the client totals, over every line
+  c1 = substr(code, 1, 1)
+  nreq[client]++
+  if (c1 == "2" || c1 == "3") ok[client]++
+  if ((c1 == "2" || code == "304") && lp ~ /\.(css|js|mjs|woff2?|ttf|otf|png|jpe?g|gif|svg|webp|avif)$/) asset[client]++
+  if (c1 == "4" || c1 == "5") { k = client SUBSEP lp; if (!(k in errpath)) { errpath[k] = 1; nerr[client]++ } }
+  probe = is_probe(lp)
+  if (probe) probed[client] = 1
+  if (ref ~ /^https?:\/\//) {
+    rh = tolower(ref); sub(/^[a-z]+:\/\//, "", rh); sub(/[\/:?#].*$/, "", rh); sub(/^www\./, "", rh)
+    sh = tolower(site); sub(/^www\./, "", sh)
+    if (sh == "" || rh == sh) sameref[client] = 1
+  }
+
+  watched = (code in exact) || (c1 in cls)
+  if (!watched) next
+  hard = ""
+  if (code == "403") {
+    k = kind403(parts[1], url, after, ua, ref)
+    if (k == "form" && f403 != "") print k "\t" client "\t" path "\t" src "\t" (site != "" ? site : src) >> f403
+    if (k == "") hard = "probe-403"
+  }
+  if (np != 3 || parts[1] !~ /^(GET|POST|HEAD|PUT|PATCH|DELETE|OPTIONS)$/ || parts[3] !~ /^HTTP\/[0-9.]+$/) hard = "bad-request"
+  else if (is_ip(site)) hard = "bare-ip"
+  else if (probe) hard = "probe"
+  else if (hard == "") hard = agent_hard(ua)
+  spts = 0; slab = ""
+  if (hard == "") {
+    if (ua !~ /Mozilla\/|Opera\//) soft(2, "not-a-browser")
+    else if ((v = major(ua, "Chrome/")) >= 0 && v < 100 || (v = major(ua, "Firefox/")) >= 0 && v < 100 || ua ~ /MSIE |Trident\//) soft(2, "old-browser")
+    if (parts[1] == "HEAD") soft(2, "head-request")
+    if (parts[3] == "HTTP/1.0") soft(2, "http1.0")
+  }
+  agent = ua; gsub(/\t/, " ", agent); if (length(agent) > 150) agent = substr(agent, 1, 150) "..."
+  print code "\t" client "\t" path "\t" src "\t" site "\t" (hard != "" ? hard : "-") "\t" spts "\t" (slab != "" ? slab : "-") "\t" parts[1] "\t" agent
 }
-END { print src "\t" (total + 0) "\t" (unparsed + 0) >> stats }
+END {
+  print src "\t" (total + 0) "\t" (unparsed + 0) >> stats
+  for (c in nreq) print c "\t" nreq[c] "\t" (ok[c] + 0) "\t" (asset[c] + 0) "\t" (nerr[c] + 0) "\t" (sameref[c] + 0) "\t" (probed[c] + 0) >> cstats
+}
 '
 
 is_rotated_name() {
@@ -332,7 +439,7 @@ done
 shopt -u nullglob
 
 for f in ${LOG_FILES[@]+"${LOG_FILES[@]}"}; do
-  read_new "$f" | awk -v codes="$ERROR_CODES" -v src="$f" -v stats="$STATS" -v f403="$FORM403" "$AWK_PARSE" >> "$MATCHES"
+  read_new "$f" | awk -v codes="$ERROR_CODES" -v src="$f" -v stats="$STATS" -v cstats="$CSTATS" -v f403="$FORM403" "$AWK_PARSE" >> "$RAW"
 done
 
 # read_container <name>
@@ -362,7 +469,7 @@ read_container() {
   else
     ts_file="$STATE_DIR/docker_$(state_key "$name").ts"
     since="$(cat "$ts_file" 2>/dev/null || true)"
-    if [[ -n "$since" ]]; then
+    if [[ -n "$since" && "$EXPLAIN" != true ]]; then
       docker logs --since "$since" --until "$NOW" "$name" 2>/dev/null
     elif [[ "$DRY_RUN" == true ]]; then
       docker logs --tail 20000 "$name" 2>/dev/null
@@ -381,13 +488,57 @@ fi
 for name in $DOCKER_CONTAINERS; do
   if command -v docker >/dev/null 2>&1 && docker inspect "$name" >/dev/null 2>&1; then
     CONTAINERS+=("$name")
-    read_container "$name" | awk -v codes="$ERROR_CODES" -v src="docker:$name" -v stats="$STATS" -v f403="$FORM403" "$AWK_PARSE" >> "$MATCHES"
+    read_container "$name" | awk -v codes="$ERROR_CODES" -v src="docker:$name" -v stats="$STATS" -v cstats="$CSTATS" -v f403="$FORM403" "$AWK_PARSE" >> "$RAW"
   else
     say "Container $name not found"
     MISSING_CONTAINERS+=("$name")
   fi
 done
 SOURCE_COUNT=$(( ${#LOG_FILES[@]} + ${#CONTAINERS[@]} ))
+
+# --- bot filter, part 2: the client's behaviour ---------------------------------
+# A row with a hard reason (see AWK_PARSE) is a bot. Every other row starts from
+# its request's soft points and adds what its client did across all the logs
+# since the last run:
+#   probed            +3  also asked for a probe path (/.env, /.git/, ...)
+#   enumeration       +3  errors on 8+ different paths, under 20% answered OK:
+#                         working through a list, not reading a site
+#   all-failed        +1  not a single request answered OK
+#   loads-assets      -3  loaded 3+ css/js/font/image files: a browser
+#                         drawing the page (behind a CDN those never reach
+#                         this log, so not loading them counts for nothing)
+#   same-site-referer -2  came from one of the site's own pages
+# BOT_SCORE_THRESHOLD (3) or more is a bot. A visitor caught in an outage gets
+# nothing but errors and no assets (all-failed, +1): still real.
+# BOT_FILTER=false counts everything as real, as before the filter, except the
+# 403s that were never counted (probe-403).
+SCORE_AWK='
+FILENAME == cf { n[$1] += $2; ok[$1] += $3; as[$1] += $4; ne[$1] += $5; if ($6 + 0) sr[$1] = 1; if ($7 + 0) pr[$1] = 1; next }
+function add(pts, label) { s += pts; lab = lab (lab != "" ? "," : "") label }
+{
+  c = $2; h = $6; s = $7 + 0; lab = ($8 == "-") ? "" : $8
+  if (h == "-") {
+    if (pr[c]) add(3, "probed")
+    if (ne[c] >= 8 && ok[c] * 5 < n[c]) add(3, "enumeration")
+    if (ok[c] == 0) add(1, "all-failed")
+    if (as[c] >= 3) add(-3, "loads-assets")
+    if (sr[c]) add(-2, "same-site-referer")
+    class = (s >= thr) ? "bot" : "real"
+    why = (class == "bot") ? "behaviour" : "-"
+  } else {
+    class = "bot"; why = h; s = "-"
+  }
+  if (filter != "true") class = (h == "probe-403") ? "bot" : "real"
+  print $1, $2, $3, $4, $5, class, why, s, (lab != "" ? lab : "-"), $9, $10
+}'
+awk -F'\t' -v OFS='\t' -v cf="$CSTATS" -v thr="$BOT_SCORE_THRESHOLD" -v filter="$BOT_FILTER" \
+  "$SCORE_AWK" "$CSTATS" "$RAW" > "$ALL"
+awk -F'\t' '$6 == "real"' "$ALL" > "$MATCHES"
+awk -F'\t' '$6 == "bot"' "$ALL" > "$BOTS"
+# The outage check (5xx only) looks at every error on a normal page of a named
+# site, bots included: a bot that gets a 502 for the home page means visitors
+# get it too. Bare-IP, probe and malformed requests are still left out.
+awk -F'\t' '$7 !~ /^(bare-ip|probe|probe-403|bad-request)$/' "$ALL" > "$PAGES"
 
 declare -A CODE_COUNT=()
 while read -r n code; do
@@ -429,12 +580,52 @@ top_list() {
         END { if (NR > top) printf " and %d other %s%s", NR - top, noun, (NR - top == 1 ? "" : "s") }'
 }
 
-# top_share <code> <column> — percentage of a code's matches that come from
-# its single most common value.
+# top_share <code> <column> [file] — percentage of a code's matches (MATCHES,
+# or [file]) that come from its single most common value.
 top_share() {
   awk -F'\t' -v c="$1" -v col="$2" '
     $1 == c { t++; if ($col != "" && ++n[$col] > m) m = n[$col] }
-    END { print (t ? int(m * 100 / t) : 0) }' "$MATCHES"
+    END { print (t ? int(m * 100 / t) : 0) }' "${3:-$MATCHES}"
+}
+
+# count_in <file> <code> / clients_in <file> <code> — how many rows of a code a
+# match file has, and from how many different clients.
+count_in() {
+  awk -F'\t' -v c="$2" '$1 == c { n++ } END { print n + 0 }' "$1"
+}
+clients_in() {
+  awk -F'\t' -v c="$2" '$1 == c && !seen[$2]++ { n++ } END { print n + 0 }' "$1"
+}
+
+# min_clients_for <code> — MIN_CLIENTS_<code> if set (MIN_CLIENTS_403 predates
+# the bot filter), else MIN_REAL_CLIENTS.
+min_clients_for() {
+  local var="MIN_CLIENTS_$1"
+  printf '%s' "${!var:-$MIN_REAL_CLIENTS}"
+}
+
+# ignored_summary <code> — "214 (92 to scanner paths, 81 to the bare server
+# IP, ...)" for a code's rows scored as bots, busiest reason first; empty when
+# there are none.
+ignored_summary() {
+  awk -F'\t' -v c="$1" '$1 == c { r = ($7 == "probe-403") ? "probe" : $7; n[r]++; t++ }
+    END { for (r in n) print n[r] "\t" r; if (t) print t "\ttotal" }' "$BOTS" \
+    | sort -t$'\t' -k1,1rn \
+    | awk -F'\t' '
+        $2 == "total" { t = $1; next }
+        {
+          w = $2
+          if (w == "bare-ip") w = "to the bare server IP"
+          else if (w == "probe") w = "to scanner paths"
+          else if (w == "no-agent") w = "with no user agent"
+          else if (w == "tool-agent") w = "from scripts and scan tools"
+          else if (w == "bot-agent") w = "from self-declared bots"
+          else if (w == "crawler") w = "from search engine crawlers"
+          else if (w == "bad-request") w = "malformed requests"
+          else if (w == "behaviour") w = "from clients that behaved like bots"
+          list = list (list != "" ? ", " : "") $1 " " w
+        }
+        END { if (t) printf "%d (%s)", t, list }'
 }
 
 # code_name <code> — the standard name of an HTTP status code.
@@ -549,61 +740,90 @@ evaluate() {
   fi
 }
 
-# Any code that's over threshold now, or was alerting last time (so it can recover).
-CODES_TO_EVALUATE=(${CODE_COUNT[@]+"${!CODE_COUNT[@]}"})
+# Any code with errors now (real visitors' or, for the outage check, on site
+# pages), or that was alerting last time (so it can recover).
+mapfile -t CODES_TO_EVALUATE < <(cut -f1 "$ALL" | sort -u)
 for f in "$STATE_DIR"/alert_http_*; do
   [[ -f "$f" ]] && CODES_TO_EVALUATE+=("${f##*alert_http_}")
 done
 
-# 403s also need MIN_CLIENTS_403 different clients, so one bot hammering a
-# page doesn't alert.
-CLIENTS_403=$(awk -F'\t' '$1 == "403" { print $2 }' "$MATCHES" | sort -u | wc -l)
+# Each code alerts in one of two ways:
+#   real    more than its threshold of errors that real visitors got, from at
+#           least MIN_REAL_CLIENTS (3) of them, so one visitor (or one bot that
+#           got through the filter) hammering a page doesn't alert
+#   outage  5xx only: more than OUTAGE_THRESHOLD (100) errors on normal pages of
+#           named sites from at least OUTAGE_MIN_CLIENTS (10) clients, bots
+#           included. At 3am the only clients may be bots, but a server that
+#           answers them with 502s for the home page is down for visitors too.
+#           OUTAGE_THRESHOLD=0 turns this off.
+CLIENTS_403=$(clients_in "$MATCHES" 403)
 FORM403_COUNT=$(wc -l < "$FORM403")
 HTTP403_OVER=false
+declare -A OVER_HOW=()
 
 SUMMARY=""
+BOT_SUMMARY=""
 (( SOURCE_COUNT == 0 )) && CODES_TO_EVALUATE=()
 for code in $(printf '%s\n' ${CODES_TO_EVALUATE[@]+"${CODES_TO_EVALUATE[@]}"} | sort -u); do
   count="${CODE_COUNT[$code]:-0}"
+  clients="$(clients_in "$MATCHES" "$code")"
   threshold="$(threshold_for "$code")"
+  min_clients="$(min_clients_for "$code")"
+  bots="$(count_in "$BOTS" "$code")"
   SUMMARY+=" ${code}=${count}"
+  (( bots > 0 )) && BOT_SUMMARY+=" ${code}=${bots}"
   label="${code} $(code_name "$code")"
   label="${label% }"
   triggered=false
   alert_text=""
-  over=false
-  (( count > threshold )) && over=true
-  [[ "$code" == 403 ]] && (( CLIENTS_403 < MIN_CLIENTS_403 )) && over=false
-  if [[ "$over" == true ]]; then
+  how=""
+  if (( count > threshold && clients >= min_clients )); then
+    how=real
+  elif [[ "$code" == 5* ]] && (( OUTAGE_THRESHOLD > 0 )); then
+    pages="$(count_in "$PAGES" "$code")"
+    page_clients="$(clients_in "$PAGES" "$code")"
+    (( pages > OUTAGE_THRESHOLD && page_clients >= OUTAGE_MIN_CLIENTS )) && how=outage
+  fi
+  if [[ -n "$how" ]]; then
     triggered=true
-    if [[ "$code" == 403 ]]; then
-      HTTP403_OVER=true
-      alert_text="*HTTP ${label}*: ${count} in ${WINDOW_LABEL} from ${CLIENTS_403} clients (threshold ${threshold}; scanner paths not counted)"
+    OVER_HOW[$code]="$how"
+    [[ "$code" == 403 ]] && HTTP403_OVER=true
+    rows="$MATCHES"
+    if [[ "$how" == outage ]]; then
+      rows="$PAGES"
+      alert_text="*HTTP ${label}*: ${pages} on site pages in ${WINDOW_LABEL} from ${page_clients} clients (outage threshold ${OUTAGE_THRESHOLD}), ${count} of them to real visitors"
+    elif [[ "$BOT_FILTER" == true ]]; then
+      alert_text="*HTTP ${label}*: ${count} to real visitors in ${WINDOW_LABEL} from ${clients} clients (threshold ${threshold})"
     else
-      alert_text="*HTTP ${label}*: ${count} in ${WINDOW_LABEL} (threshold ${threshold})"
+      alert_text="*HTTP ${label}*: ${count} in ${WINDOW_LABEL} from ${clients} clients (threshold ${threshold})"
     fi
     meaning="$(code_meaning "$code")"
     [[ -n "$meaning" ]] && alert_text+=$'\n'"_${meaning}_"
-    sites="$(top_list "$MATCHES" "^${code}\$" 5 site)"
+    [[ "$how" == outage ]] && alert_text+=$'\n'"_Most of these clients look like bots, but they asked for normal pages of the site and got a server error, so visitors get it too._"
+    sites="$(top_list "$rows" "^${code}\$" 5 site)"
     if [[ -n "$sites" ]]; then
       alert_text+=$'\n'"• Top sites: ${sites}"
       [[ "$sites" == *"the server IP, not a site name"* ]] && \
         alert_text+=". Requests to the bare server IP are almost always bots scanning the internet, not real visitors."
     fi
-    alert_text+=$'\n'"• Top paths: $(top_list "$MATCHES" "^${code}\$" 3 path)"
-    alert_text+=$'\n'"• Top clients: $(top_list "$MATCHES" "^${code}\$" 2 client)"
-    share="$(top_share "$code" 2)"
-    (( count >= 20 && share >= 80 )) && \
+    alert_text+=$'\n'"• Top paths: $(top_list "$rows" "^${code}\$" 3 path)"
+    alert_text+=$'\n'"• Top clients: $(top_list "$rows" "^${code}\$" 2 client)"
+    share="$(top_share "$code" 2 "$rows")"
+    (( $(count_in "$rows" "$code") >= 20 && share >= 80 )) && \
       alert_text+=". ${share}% came from one client, so this is most likely a single bot or scanner."
     if (( SOURCE_COUNT > 1 )); then
-      alert_text+=$'\n'"• Top logs: $(top_list "$MATCHES" "^${code}\$" 4 log)"
+      alert_text+=$'\n'"• Top logs: $(top_list "$rows" "^${code}\$" 4 log)"
+    fi
+    if [[ "$BOT_FILTER" == true && "$how" == real ]]; then
+      ignored="$(ignored_summary "$code")"
+      [[ -n "$ignored" ]] && alert_text+=$'\n'"• Not counted, as bots: ${ignored}"
     fi
     if [[ "$code" == 403 && "$FORM_403_CHECK" == true ]] && (( FORM403_COUNT > 0 )); then
       alert_text+=$'\n'"• Refused form POSTs: $(top_list "$FORM403" '^form$' 5 site)"
     fi
   fi
   evaluate "http_${code}" "$triggered" "$alert_text" \
-    "HTTP ${label} is back under threshold (${count} in ${WINDOW_LABEL}, threshold ${threshold})"
+    "HTTP ${label} is back under threshold (${count} to real visitors in ${WINDOW_LABEL}, threshold ${threshold})"
 done
 
 # --- refused form POSTs ------------------------------------------------------
@@ -675,9 +895,48 @@ for name in $DOCKER_CONTAINERS; do
     "Container \`${name}\` is back — monitoring its access log again"
 done
 
-log "Checked ${SOURCE_COUNT} log source(s), ${TOTAL_LINES} lines (${TOTAL_UNPARSED} unparsed); codes:${SUMMARY:- none}; 403: form=${FORM403_COUNT} clients=${CLIENTS_403}; kernel(${KERNEL_SOURCE_USED:-off}): segfault=${SEGFAULTS} gpf=${GPFS}"
+log "Checked ${SOURCE_COUNT} log source(s), ${TOTAL_LINES} lines (${TOTAL_UNPARSED} unparsed); codes (real visitors):${SUMMARY:- none}; ignored as bots:${BOT_SUMMARY:- none}; 403: form=${FORM403_COUNT} clients=${CLIENTS_403}; kernel(${KERNEL_SOURCE_USED:-off}): segfault=${SEGFAULTS} gpf=${GPFS}"
 
 # --- report -----------------------------------------------------------------
+# by_client <file> [top] — the clients in a match file, busiest first: count,
+# client, codes, a site, what the filter made of it (its most common reason,
+# with score and signals) and an example path with its user agent.
+by_client() {
+  awk -F'\t' '
+    {
+      c = $2; n[c]++
+      if (index("," codes[c] ",", "," $1 ",") == 0) codes[c] = codes[c] (codes[c] != "" ? "," : "") $1
+      w = ($7 == "-") ? "" : ($7 == "behaviour" ? "bot-like behaviour, " : $7)
+      if ($8 != "-") w = w "score " $8
+      if ($9 != "-") w = w " (" $9 ")"
+      if (++nw[c, w] > best[c]) { best[c] = nw[c, w]; why[c] = w; site[c] = ($5 != "" ? $5 : "-"); path[c] = $3; ua[c] = $11 }
+    }
+    END { for (c in n) printf "%d\t%s\t%s\t%s\t%s\t%s\t%s\n", n[c], c, codes[c], site[c], why[c], path[c], ua[c] }' "$1" \
+    | sort -t$'\t' -k1,1rn | head -n "${2:-25}" \
+    | awk -F'\t' '{ printf "  %5d  %-15s  %-11s  %-24s  %s\n         e.g. %s  \"%s\"\n", $1, $2, $3, $4, $5, $6, $7 }'
+}
+
+# explain — for --explain: what the bot filter made of the errors it read.
+explain() {
+  local code real clients ignored
+  echo
+  echo "Bot filter (BOT_FILTER=${BOT_FILTER}): a client scoring ${BOT_SCORE_THRESHOLD} or more (BOT_SCORE_THRESHOLD) is a bot."
+  echo "These logs were read from up to 5 MB back, so the counts cover more than 5 minutes."
+  for code in $(cut -f1 "$ALL" | sort -u); do
+    real="$(count_in "$MATCHES" "$code")"
+    clients="$(clients_in "$MATCHES" "$code")"
+    ignored="$(ignored_summary "$code")"
+    echo "  ${code}: ${real} to real visitors from ${clients} client(s); not counted: ${ignored:-none}"
+  done
+  echo
+  echo "Real visitors who got errors, busiest first (count, client, codes, site, score and signals):"
+  if [[ -s "$MATCHES" ]]; then by_client "$MATCHES" "$EXPLAIN_TOP"; else echo "  none"; fi
+  echo
+  echo "Clients scored as bots, busiest first (count, client, codes, site, reason):"
+  if [[ -s "$BOTS" ]]; then by_client "$BOTS" "$EXPLAIN_TOP"; else echo "  none"; fi
+  echo
+}
+
 if [[ "$DRY_RUN" == true ]]; then
   echo "Log sources (${SOURCE_COUNT}):"
   while IFS=$'\t' read -r src lines unparsed; do
@@ -687,14 +946,20 @@ if [[ "$DRY_RUN" == true ]]; then
   if [[ ",$(tr -d '[:space:]' <<< "$ERROR_CODES" | tr 'X' 'x')," =~ ,(403|4xx), ]]; then
     echo "403s: ${FORM403_COUNT} refused form POST(s), ${CODE_COUNT[403]:-0} refused visitor request(s) in all from ${CLIENTS_403} client(s) (scanner paths not counted)"
   fi
-  for code in $(printf '%s\n' ${CODE_COUNT[@]+"${!CODE_COUNT[@]}"} | sort); do
-    threshold="$(threshold_for "$code")"
-    [[ "$code" == 403 ]] && (( CLIENTS_403 < MIN_CLIENTS_403 )) && continue
-    (( CODE_COUNT[$code] > threshold )) && echo "  $code is OVER its threshold of $threshold"
+  if [[ "$BOT_FILTER" == true ]]; then
+    echo "Errors scored as bots, not counted:${BOT_SUMMARY:- none} (--explain shows why)"
+  fi
+  for code in $(printf '%s\n' ${OVER_HOW[@]+"${!OVER_HOW[@]}"} | sort); do
+    if [[ "${OVER_HOW[$code]}" == outage ]]; then
+      echo "  $code is OVER the outage threshold of $OUTAGE_THRESHOLD (errors on site pages, bots included)"
+    else
+      echo "  $code is OVER its threshold of $(threshold_for "$code")"
+    fi
   done
   if [[ "$CHECK_KERNEL" == true ]]; then
     echo "Kernel (${KERNEL_SOURCE_USED:-no source}): ${SEGFAULTS} ${KERNEL_FAULT_PROCESS} segfault(s), ${GPFS} general protection fault(s) (threshold ${KERNEL_FAULT_THRESHOLD})"
   fi
+  [[ "$EXPLAIN" == true ]] && explain
   echo "(dry run — nothing sent to Slack, no state saved)"
   exit 0
 fi

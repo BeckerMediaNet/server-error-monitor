@@ -2,11 +2,16 @@
 
 Server-level watchdog that posts to Slack when:
 
-- **HTTP errors spike.** Any single monitored status code (default
-  `403,500,502,503,504`) shows up **more than 50 times** in the web server
-  access logs since the previous run. A 403 only counts when a visitor was
-  refused, from at least 3 clients: scanner paths (`/.env`, `/wp-login.php`,
-  ...) never count (see [403s](#403s)).
+- **Real visitors get HTTP errors.** Any single monitored status code
+  (default `403,500,502,503,504`) went to real visitors **more than 50
+  times** since the previous run, from at least 3 of them. Every error is
+  scored as bot or real traffic first, so scanners hitting the bare server IP
+  or probing for `/.env` never count (see [Bot filter](#bot-filter)). A 403
+  only counts when a visitor was refused (see [403s](#403s)).
+- **A site is down, whoever noticed.** A 5xx code went to **more than 100**
+  requests for normal pages of a named site from 10+ clients, even if most of
+  them were bots: at 3am the only clients may be bots, and a 502 for them is
+  a 502 for visitors too.
 - **A form POST is refused (403).** Any one: a visitor could not send the
   form. Per site. Bots and scanners don't count.
 - **php-fpm is crashing.** The kernel log shows **3 or more** php-fpm
@@ -99,12 +104,12 @@ monitor logs a warning, and the setup dry run shows it.
 `THRESHOLD_<code>` lines in `.env` override `ERROR_THRESHOLD` for one code.
 
 Each alert gives the code's name, a one-line plain-English explanation of
-what it means, and the busiest URLs (query strings dropped) and visitor IPs.
-When most of the errors come from one IP, the alert says it's likely a bot or
-scanner. The alert also lists the sites, when the log format includes the
-hostname (as nginx-proxy's `vhost` format and Apache's `vhost_combined` do).
-Requests sent to the server's bare IP address are marked as such, since
-they're almost always bots. When several logs are watched, the alert shows
+what it means, and the busiest URLs (query strings dropped) and visitor IPs,
+counting only the errors real visitors got. It also says how many errors were
+left out as bots, and why. When most of the errors come from one IP, the alert
+says it's likely a bot or scanner. The alert also lists the sites, when the
+log format includes the hostname (as nginx-proxy's `vhost` format and
+Apache's `vhost_combined` do). When several logs are watched, the alert shows
 which one the errors came from.
 
 Example:
@@ -112,12 +117,79 @@ Example:
 ```
 🚨 aai.edu: server error alert
 
-HTTP 503 Service Unavailable: 81 in the last 5 minutes (threshold 50)
+HTTP 503 Service Unavailable: 60 to real visitors in the last 5 minutes from 6 clients (threshold 50)
 The server turned these requests away: it was overloaded or in maintenance mode, or no site is set up for the address that was requested.
-• Top sites: `64.23.213.183` (81, the server IP, not a site name). Requests to the bare server IP are almost always bots scanning the internet, not real visitors.
-• Top paths: `/wrangler.toml` (1), `/vultr.json` (1), `/vercel.json` (1), `/tencent.json` (1), `/service_account.json` (1) and 76 other paths
-• Top clients: `85.155.14.16` (81). 100% came from one client, so this is most likely a single bot or scanner.
+• Top sites: `aai.edu` (60)
+• Top paths: `/programs/` (60)
+• Top clients: `203.0.113.61` (10), `203.0.113.62` (10), `203.0.113.63` (10), `203.0.113.64` (10), `203.0.113.65` (10) and 1 other client
+• Not counted, as bots: 89 (80 to the bare server IP, 9 from clients that behaved like bots)
 ```
+
+## Bot filter
+
+Before any threshold is checked, every monitored error is scored as **bot**
+or **real** traffic, and only real visitors' errors count. The log line is
+all there is to go on, so this looks at what each request asked for and at
+what its client (IP address) did across everything it requested since the
+last run, errors and successes alike.
+
+**Always a bot**, whatever else the client did:
+
+| Reason | What it means |
+|---|---|
+| `bare-ip` | sent to the server's IP address, not a site name (needs the hostname in the log, see above) |
+| `probe` | a path no visitor asks for: dot files (`/.env`, `/.git/`), backups and config files (`.sql`, `.zip`, `.yml`, `.toml`, a `.json` at the web root), `.php` files other than WordPress's own (`xmlrpc.php` included), `/vendor/`, `/cgi-bin/`, phpMyAdmin |
+| `bad-request` | no proper `METHOD /path HTTP/x` request line (TLS sent to port 80, `-`, an unknown method) |
+| `no-agent` | no User-Agent |
+| `tool-agent` | a script or scan tool: curl, wget, python, Go, Java, zgrab, nuclei, wpscan, headless browsers, ... |
+| `bot-agent` | an agent that says it's a bot (`bot/`, `crawl`, `spider`, a URL in it) |
+| `crawler` | a search engine (Googlebot, Bingbot, ...): it matters for SEO, but it isn't a visitor |
+
+**Everyone else gets a score**; 3 or more (`BOT_SCORE_THRESHOLD`) is a bot:
+
+| Signal | Points | Why |
+|---|---|---|
+| `probed` | +3 | the same client also asked for a probe path |
+| `enumeration` | +3 | errors on 8+ different paths and under 20% of its requests answered OK: working through a list |
+| `not-a-browser` | +2 | the agent isn't a browser's `Mozilla/...` string |
+| `old-browser` | +2 | Chrome or Firefox older than 100, or Internet Explorer: bots copy old strings, browsers update themselves |
+| `head-request` | +2 | `HEAD`: browsers never send one |
+| `http1.0` | +2 | `HTTP/1.0`: browsers never send one |
+| `all-failed` | +1 | not one of its requests was answered OK |
+| `loads-assets` | −3 | loaded 3+ css/js/font/image files: a browser drawing the page |
+| `same-site-referer` | −2 | came from one of the site's own pages |
+
+A visitor caught in an outage gets nothing but errors and loads no assets
+(`all-failed`, +1), so still counts as real. Not loading assets never counts
+against a client: behind a CDN those requests never reach this log.
+
+**Outages still alert when only bots noticed.** For 5xx codes, normal pages of
+named sites (bare-IP, probe and malformed requests left out) that got more
+than `OUTAGE_THRESHOLD` (100) errors from at least `OUTAGE_MIN_CLIENTS` (10)
+clients alert even when most of those clients are bots. `OUTAGE_THRESHOLD=0`
+turns this off.
+
+**See what it makes of a server's traffic** before trusting it:
+
+```bash
+sudo /opt/server-error-monitor/bin/check-server-errors.sh --explain
+./fleet-explain.sh servers.txt          # the same on many servers, one line each
+```
+
+`--explain` is a dry run over the last 5 MB of each log (nothing sent, no
+state saved). It lists the errors per code split into real and bot, then the
+busiest real and bot clients with the reason or score for each. Once a few
+servers look right, `ERROR_THRESHOLD` can probably come down from 50, since
+the bot noise it was set against is gone.
+
+Every run's log line also records the ignored counts (`ignored as bots:
+503=81`). `BOT_FILTER=false` counts every error again, as before the filter
+(the 403 rules below still apply).
+
+Limits: with plain `combined` logs (no hostname) `bare-ip` can't be told, so
+those scanners are caught by their behaviour instead. Behind Cloudflare or a
+load balancer, the client is the visitor only if nginx is set up to log the
+real IP; otherwise every visitor looks like one client.
 
 **Kernel log**: it uses the systemd journal (`journalctl -k --since
 @<last run>`) when available, otherwise `/var/log/kern.log` or
@@ -163,10 +235,11 @@ refused a visitor are counted. Each one is sorted:
   `wp-login.php`, `xmlrpc.php`, `/wp-admin/`, backups and archives, and POSTs
   with no Referer.
 
-The counted 403s (form POSTs and visitors) alert like any other code, above
-`THRESHOLD_403` (default `ERROR_THRESHOLD`, 50), but only when they come from
-at least `MIN_CLIENTS_403` (3) different clients, so one bot hammering a page
-doesn't. While that alert is firing, any refused form POSTs are listed in it
+The counted 403s (form POSTs and visitors) then go through the
+[bot filter](#bot-filter) and alert like any other code, above
+`THRESHOLD_403` (default `ERROR_THRESHOLD`, 50) from at least
+`MIN_CLIENTS_403` (default `MIN_REAL_CLIENTS`, 3) different clients, so one
+bot hammering a page doesn't. While that alert is firing, any refused form POSTs are listed in it
 instead of alerting separately, so one block is never reported twice.
 
 To stop monitoring 403s, refused form POSTs included, remove `403` from
@@ -224,6 +297,7 @@ host kernel, so their segfaults land in the host's kernel log.
 ```
 install.sh                   one-command entry point (clone/update + hand off to setup.sh)
 fleet-install.sh             install/update on many servers over SSH, no questions
+fleet-explain.sh             what the bot filter makes of each server's traffic (--explain over SSH)
 test/run.sh                  the checks against crafted log lines, in a throwaway container (needs docker)
 setup.sh                     interactive configurator (writes .env, tests Slack, dry run, installs cron)
 bin/check-server-errors.sh   the actual check, run by root's cron every 5 minutes
@@ -245,6 +319,7 @@ bin/check-server-errors.sh   the actual check, run by root's cron every 5 minute
 ```bash
 sudo /opt/server-error-monitor/bin/check-server-errors.sh --test-slack
 sudo /opt/server-error-monitor/bin/check-server-errors.sh --dry-run   # counts only, no Slack, no state saved
+sudo /opt/server-error-monitor/bin/check-server-errors.sh --explain   # dry run over the last 5 MB: bot vs real, and why
 sudo /opt/server-error-monitor/bin/check-server-errors.sh             # real check, once
 tail /opt/server-error-monitor/logs/server-error-monitor.log
 ```
@@ -254,7 +329,8 @@ position yet, it reads the last 5 MB of the file (the current boot for the
 journal), which is handy for checking the log format parses.
 
 Automated: `test/run.sh` runs the checks (403 form POSTs, visitor 403s, the
-existing HTTP error alert, cooldown/recovery, `setup.sh --non-interactive`)
+existing HTTP error alert, the bot filter and outage check, `--explain`,
+cooldown/recovery, `setup.sh --non-interactive`)
 against crafted log lines in a throwaway Debian container with a fake Slack.
 
 To reset everything (e.g. after changing `ACCESS_LOGS`), delete
@@ -276,9 +352,10 @@ git push -u origin main
 
 ## Notes / things worth deciding per server
 
-- **404s are noisy.** Bots probing `/wp-login.php`, `/.env` and so on can
-  easily produce 50+ 404s in 5 minutes. If you monitor `4xx` or `404`, give
-  it its own higher threshold (`THRESHOLD_404=300`).
+- **404s are noisy.** The bot filter drops the scanners probing `/.env` and
+  the like, but real visitors following broken links still add up. If you
+  monitor `4xx` or `404`, give it its own higher threshold
+  (`THRESHOLD_404=300`).
 - **One busy site can mask another**: the thresholds are per code across
   all watched logs combined. The "Top sites" / "Top logs" lines in the alert
   show where the errors came from.
