@@ -294,6 +294,16 @@ AWK_PARSE='
 function is_ip(s) {
   return s ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/ || s ~ /^[0-9a-fA-F]*:[0-9a-fA-F]*:[0-9a-fA-F:.]*$/
 }
+function private(a) {
+  return a ~ /^(10\.|127\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[01])\.)/ || tolower(a) ~ /^f[cd][0-9a-f]*:/
+}
+# uacode <user agent> — a short code (6 hex digits) that is the same for the same browser string
+function uacode(ua,   h, i) {
+  if (ua in UAC) return UAC[ua]
+  h = 0
+  for (i = 1; i <= length(ua); i++) h = (h * 31 + ORD[substr(ua, i, 1)]) % 16777213
+  return UAC[ua] = sprintf("%06x", h)
+}
 function kind403(method, url, after, ua, ref,   lp, qs, j, bytes, endpoint, page, browser) {
   lp = tolower(url); qs = ""
   j = index(lp, "?"); if (j > 0) { qs = substr(lp, j + 1); lp = substr(lp, 1, j - 1) }
@@ -345,6 +355,7 @@ BEGIN {
     else if (c != "") exact[c] = 1
   }
   esc = sprintf("%c", 27)
+  for (i = 32; i < 127; i++) ORD[sprintf("%c", i)] = i
 }
 NF == 0 { next }
 {
@@ -381,6 +392,10 @@ NF == 0 { next }
     else { ua = substr(rest, RSTART + 1, RLENGTH - 2); break }
     rest = substr(rest, RSTART + RLENGTH)
   }
+  # Behind a load balancer every visitor arrives from the private address of the balancer, so that address alone is one
+  # client for everyone: never MIN_REAL_CLIENTS of them, and one bot probing through it counts against every visitor.
+  # There the client is the address plus a short code for the browser string.
+  if (private(client)) client = client " browser " uacode(ua)
 
   # the client totals, over every line
   c1 = substr(code, 1, 1)

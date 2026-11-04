@@ -144,6 +144,31 @@ has "E1: ... the client that asked for /.env" "$out" "score 4 (probed,all-failed
 has "E1: ... the outage's bots" "$out" "bot-agent"
 has "E1: dry run reports the ignored counts" "$out" "Errors scored as bots, not counted:"
 has "E2: the run log has the ignored counts" "$(tail -3 $D/logs/server-error-monitor.log)" "ignored as bots: 502=150"
+echo "-- behind a load balancer: every client is the balancer's private address"
+LB1=10.138.132.111; LB2=10.138.248.36
+lb() { if [ $(( $1 % 2 )) = 0 ]; then echo $LB1; else echo $LB2; fi; }
+UA() { echo "Mozilla/5.0 (iPhone; CPU iPhone OS 18_$(( $1 % 40 )) like Mac OS X) AppleWebKit/605.1.15"; }
+for i in $(seq 80); do v edu.test $(lb $i) GET /programs/ 200 9000 "https://edu.test/" "$(UA $i)"; v edu.test $(lb $i) GET /wp-content/themes/x/style.css 200 900 "https://edu.test/programs/" "$(UA $i)"; done
+for i in $(seq 30); do v edu.test $(lb $i) GET /.env 404 150 "-" "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/125.0.0.0"; v edu.test $(lb $i) GET /old-$i.php 404 150 "-" "python-requests/2.31"; done
+: > /tmp/slack.log; $C; $C; : > /tmp/slack.log
+for i in $(seq 150); do v edu.test $(lb $i) GET /programs/ 502 157 "https://edu.test/" "$(UA $i)"; done
+for i in $(seq 10); do v edu.test $(lb $i) GET /.git/config 404 150 "-" "python-requests/2.31"; done
+$C; s=$(slack)
+has "LB1: 150 x 502 to 40 browsers through 2 balancer addresses, bots probing alongside: the alert" "$s" "*HTTP 502 Bad Gateway*: 150 to real visitors in"
+has "LB1: ... a client is the address plus the browser" "$s" "from 40 clients"
+: > /tmp/slack.log; $C; $C; : > /tmp/slack.log
+for i in $(seq 150); do v edu.test $(lb $i) GET /programs/ 502 157 "https://edu.test/" "$PH"; done
+$C; lacks "LB2: 150 x 502 to one browser string through the balancers (one client): no alert" "$(slack)" "HTTP 502"
+: > /tmp/slack.log; $C; $C; : > /tmp/slack.log
+for i in $(seq 60); do v edu.test $(lb $i) GET /programs/ 403 199 "https://edu.test/" "$(UA $i)"; done
+$C; s=$(slack); has "LB3: 60 page 403s to 40 browsers through the balancers: the 403 alert" "$s" "*HTTP 403 Forbidden*: 60 to real visitors in"
+: > /tmp/slack.log; $C; $C; : > /tmp/slack.log
+v edu.test $LB1 POST /wp-admin/admin-ajax.php 403 162 "https://edu.test/apply/" "$PH"
+$C; has "LB4: a refused form POST through a balancer address alerts" "$(slack)" "edu.test"
+: > /tmp/slack.log; $C; $C; : > /tmp/slack.log
+for i in $(seq 150); do v rot.test 203.0.113.77 GET /programs/ 502 157 "https://rot.test/" "$(UA $i)"; done
+$C; lacks "LB5: one public address with 40 browser strings is still one client: no alert" "$(slack)" "HTTP 502"
+: > /tmp/slack.log; $C; $C; : > /tmp/slack.log
 echo "-- BOT_FILTER=false: every error counts, as before"
 echo "BOT_FILTER=false" >> $D/.env; : > /tmp/slack.log
 for i in $(seq 60); do v 64.23.213.183 198.51.100.$(( i % 10 + 1 )) GET / 503 197 "-" "$DESK"; done

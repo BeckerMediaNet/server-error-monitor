@@ -187,9 +187,13 @@ Every run's log line also records the ignored counts (`ignored as bots:
 (the 403 rules below still apply).
 
 Limits: with plain `combined` logs (no hostname) `bare-ip` can't be told, so
-those scanners are caught by their behaviour instead. Behind Cloudflare or a
-load balancer, the client is the visitor only if nginx is set up to log the
-real IP; otherwise every visitor looks like one client.
+those scanners are caught by their behaviour instead. Behind Cloudflare, the
+client is the visitor only if nginx is set up to log the real IP; otherwise
+every visitor looks like one client. Behind a load balancer that logs as its
+own private address (10/8, 172.16/12, 192.168/16, 127/8, fc00::/7), a client is
+that address plus a short code for the browser string (`10.138.248.36 browser
+e7bfe6`), so visitors count separately and a bot's probes count against that
+bot only. A public address is always one client, whatever browser it sends.
 
 **Kernel log**: it uses the systemd journal (`journalctl -k --since
 @<last run>`) when available, otherwise `/var/log/kern.log` or
